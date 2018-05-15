@@ -15,6 +15,9 @@
  * put it inside the section definition.
  */
 
+#include "dyn.lds.S"
+
+#if 0
 #ifdef CONFIG_X86_32
 #define LOAD_OFFSET __PAGE_OFFSET
 #else
@@ -412,4 +415,4 @@ INIT_PER_CPU(irq_stack_union);
 . = ASSERT(kexec_control_code_size <= KEXEC_CONTROL_CODE_MAX_SIZE,
            "kexec control code size is too big");
 #endif
-
+#endif

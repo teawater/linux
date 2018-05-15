@@ -11,10 +11,10 @@ OBJECT_FILES_NON_STANDARD	:= y
 
 subdir- := rm
 
-obj-y += init.o
-obj-y += rmpiggy.o
+#obj-y += init.o
+#obj-y += rmpiggy.o
 
-$(obj)/rmpiggy.o: $(obj)/rm/realmode.bin
+#$(obj)/rmpiggy.o: $(obj)/rm/realmode.bin
 
-$(obj)/rm/realmode.bin: FORCE
-	$(Q)$(MAKE) $(build)=$(obj)/rm $@
+#$(obj)/rm/realmode.bin: FORCE
+#	$(Q)$(MAKE) $(build)=$(obj)/rm $@

@@ -86,18 +86,18 @@ vmlinux_link()
 	local lds="${objtree}/${KBUILD_LDS}"
 	local objects
 
-	if [ "${SRCARCH}" != "um" ]; then
-		objects="--whole-archive			\
-			built-in.a				\
-			--no-whole-archive			\
-			--start-group				\
-			${KBUILD_VMLINUX_LIBS}			\
-			--end-group				\
-			${1}"
-
-		${LD} ${LDFLAGS} ${LDFLAGS_vmlinux} -o ${2}	\
-			-T ${lds} ${objects}
-	else
+# 	if [ "${SRCARCH}" != "um" ]; then
+# 		objects="--whole-archive			\
+# 			built-in.a				\
+# 			--no-whole-archive			\
+# 			--start-group				\
+# 			${KBUILD_VMLINUX_LIBS}			\
+# 			--end-group				\
+# 			${1}"
+# 
+# 		${LD} ${LDFLAGS} ${LDFLAGS_vmlinux} -o ${2}	\
+# 			-T ${lds} ${objects}
+# 	else
 		objects="-Wl,--whole-archive			\
 			built-in.a				\
 			-Wl,--no-whole-archive			\
@@ -111,7 +111,7 @@ vmlinux_link()
 			${objects}				\
 			-lutil -lrt -lpthread
 		rm -f linux
-	fi
+# 	fi
 }
 
 
