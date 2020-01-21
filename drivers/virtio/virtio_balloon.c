@@ -19,6 +19,8 @@
 #include <linux/mount.h>
 #include <linux/magic.h>
 #include <linux/pseudo_fs.h>
+#include <linux/proc_fs.h>
+#include <linux/seq_file.h>
 
 /*
  * Balloon device works in 4K page units.  So each page is pointed to by
@@ -861,6 +863,28 @@ static int virtio_balloon_register_shrinker(struct virtio_balloon *vb)
 	return register_shrinker(&vb->shrinker);
 }
 
+static int proc_virtio_balloon_write(struct seq_file *seq, void *v)
+{
+	struct virtio_balloon *vb = seq->private;
+	struct page *page, *tmp;
+	char *addr;
+	struct balloon_dev_info *vb_dev_info = &vb->vb_dev_info;
+	int count = 0;
+
+	mutex_lock(&vb->balloon_lock);
+	list_for_each_entry_safe(page, tmp, &vb_dev_info->pages, lru) {
+		addr = kmap_atomic(page);
+		addr[0] = 1;
+		kunmap_atomic(addr);
+		count++;
+	}
+	mutex_unlock(&vb->balloon_lock);
+
+	seq_printf(seq, "%d\n", count);
+
+	return 0;
+}
+
 static int virtballoon_probe(struct virtio_device *vdev)
 {
 	struct virtio_balloon *vb;
@@ -949,6 +973,10 @@ static int virtballoon_probe(struct virtio_device *vdev)
 
 	if (towards_target(vb))
 		virtballoon_changed(vdev);
+
+	proc_create_single_data("virtio_balloon", 0, NULL,
+				proc_virtio_balloon_write, (void *)vb);
+
 	return 0;
 
 out_del_balloon_wq:
