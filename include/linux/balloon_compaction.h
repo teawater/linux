@@ -100,8 +100,12 @@ static inline void balloon_page_insert(struct balloon_dev_info *balloon,
 				       struct page *page)
 {
 	__SetPageOffline(page);
-	__SetPageMovable(page, balloon->inode->i_mapping);
-	set_page_private(page, (unsigned long)balloon);
+	if (balloon->inode) {
+		__SetPageMovable(page, balloon->inode->i_mapping);
+		set_page_private(page, (unsigned long)balloon);
+	} else {
+		set_page_private(page, 0);
+	}
 	list_add(&page->lru, &balloon->pages);
 }
 
@@ -116,8 +120,10 @@ static inline void balloon_page_insert(struct balloon_dev_info *balloon,
 static inline void balloon_page_delete(struct page *page)
 {
 	__ClearPageOffline(page);
-	__ClearPageMovable(page);
-	set_page_private(page, 0);
+	if (page_private(page)) {
+		__ClearPageMovable(page);
+		set_page_private(page, 0);
+	}
 	/*
 	 * No touch page.lru field once @page has been isolated
 	 * because VM is using the field.
