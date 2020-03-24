@@ -5011,6 +5011,14 @@ mem_cgroup_css_alloc(struct cgroup_subsys_state *parent_css)
 	if (parent) {
 		memcg->swappiness = mem_cgroup_swappiness(parent);
 		memcg->oom_kill_disable = parent->oom_kill_disable;
+#ifdef CONFIG_TRANSPARENT_HUGEPAGE
+		memcg->transparent_hugepage_disabled
+			= parent->transparent_hugepage_disabled;
+#endif
+	} else {
+#ifdef CONFIG_TRANSPARENT_HUGEPAGE
+		memcg->transparent_hugepage_disabled = false;
+#endif
 	}
 	if (parent && parent->use_hierarchy) {
 		memcg->use_hierarchy = true;
@@ -6126,6 +6134,24 @@ static ssize_t memory_oom_group_write(struct kernfs_open_file *of,
 	return nbytes;
 }
 
+static u64 transparent_hugepage_disabled_read(struct cgroup_subsys_state *css,
+					      struct cftype *cft)
+{
+	struct mem_cgroup *memcg = mem_cgroup_from_css(css);
+
+	return memcg->transparent_hugepage_disabled;
+}
+
+static int transparent_hugepage_disabled_write(struct cgroup_subsys_state *css,
+					       struct cftype *cft, u64 val)
+{
+	struct mem_cgroup *memcg = mem_cgroup_from_css(css);
+
+	memcg->transparent_hugepage_disabled = !!val;
+
+	return 0;
+}
+
 static struct cftype memory_files[] = {
 	{
 		.name = "current",
@@ -6178,6 +6204,12 @@ static struct cftype memory_files[] = {
 		.flags = CFTYPE_NOT_ON_ROOT | CFTYPE_NS_DELEGATABLE,
 		.seq_show = memory_oom_group_show,
 		.write = memory_oom_group_write,
+	},
+	{
+		.name = "transparent_hugepage_disabled",
+		.flags = CFTYPE_NOT_ON_ROOT,
+		.read_u64 = transparent_hugepage_disabled_read,
+		.write_u64 = transparent_hugepage_disabled_write,
 	},
 	{ }	/* terminate */
 };
@@ -6785,6 +6817,16 @@ void mem_cgroup_uncharge_skmem(struct mem_cgroup *memcg, unsigned int nr_pages)
 	mod_memcg_state(memcg, MEMCG_SOCK, -nr_pages);
 
 	refill_stock(memcg, nr_pages);
+}
+
+bool memcg_transparent_hugepage_disabled(struct vm_area_struct *vma)
+{
+	struct mem_cgroup *memcg = get_mem_cgroup_from_mm(vma->vm_mm);
+
+	if (memcg && memcg->transparent_hugepage_disabled)
+		return true;
+
+	return false;
 }
 
 static int __init cgroup_memory(char *s)

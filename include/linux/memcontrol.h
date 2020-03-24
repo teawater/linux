@@ -320,6 +320,8 @@ struct mem_cgroup {
 
 #ifdef CONFIG_TRANSPARENT_HUGEPAGE
 	struct deferred_split deferred_split_queue;
+
+	bool transparent_hugepage_disabled;
 #endif
 
 	struct mem_cgroup_per_node *nodeinfo[0];

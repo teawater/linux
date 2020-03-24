@@ -1810,6 +1810,10 @@ repeat:
 		goto alloc_nohuge;
 	if (shmem_huge == SHMEM_HUGE_DENY || sgp_huge == SGP_NOHUGE)
 		goto alloc_nohuge;
+#ifdef CONFIG_TRANSPARENT_HUGEPAGE
+	if (memcg_transparent_hugepage_disabled(vma))
+		goto alloc_nohuge;
+#endif
 	if (shmem_huge == SHMEM_HUGE_FORCE)
 		goto alloc_huge;
 	switch (sbinfo->huge) {
