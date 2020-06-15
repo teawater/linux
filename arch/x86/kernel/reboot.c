@@ -96,6 +96,8 @@ static int __init set_efi_reboot(const struct dmi_system_id *d)
 
 void __noreturn machine_real_restart(unsigned int type)
 {
+	unsigned long cr4_mask = 0;
+
 	local_irq_disable();
 
 	/*
@@ -122,7 +124,23 @@ void __noreturn machine_real_restart(unsigned int type)
 
 	/* Exiting long mode will fail if CR4.PCIDE is set. */
 	if (boot_cpu_has(X86_FEATURE_PCID))
-		cr4_clear_bits(X86_CR4_PCIDE);
+		cr4_mask |= X86_CR4_PCIDE;
+
+	/*
+	 * 5-level paging must be disabled as the trampoline_pgd address
+	 * expects 4-level paging.
+	 */
+	if (boot_cpu_has(X86_FEATURE_LA57))
+		cr4_mask |= X86_CR4_LA57;
+
+	/*
+	 * CR4.PCIDE and CR4.LA57 bits must be cleared atomically. If not, the
+	 * clearing of CR4.PCIDE bit will trigger re-evaluation of the CR3,
+	 * expecting 4-level paging entry while the 5-level paging will still
+	 * be in use.
+	 */
+	if (cr4_mask)
+		cr4_clear_bits(cr4_mask);
 #endif
 
 	/* Jump to the identity-mapped low memory code */
