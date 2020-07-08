@@ -70,6 +70,9 @@ extern size_t balloon_page_list_enqueue(struct balloon_dev_info *b_dev_info,
 				      struct list_head *pages);
 extern size_t balloon_page_list_dequeue(struct balloon_dev_info *b_dev_info,
 				     struct list_head *pages, size_t n_req_pages);
+extern size_t balloon_page_list_dequeue_cont(struct balloon_dev_info *b_dev_info,
+					     struct list_head *pages, struct page **first_page,
+					     size_t max_req_pages);
 
 static inline struct page *balloon_page_alloc(void)
 {

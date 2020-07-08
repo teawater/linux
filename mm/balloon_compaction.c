@@ -111,6 +111,82 @@ size_t balloon_page_list_dequeue(struct balloon_dev_info *b_dev_info,
 }
 EXPORT_SYMBOL_GPL(balloon_page_list_dequeue);
 
+/**
+ * balloon_page_list_dequeue_cont() - removes continuous pages from balloon's page list
+ *				      and returns a list of the continuous pages.
+ * @b_dev_info: balloon device decriptor where we will grab a page from.
+ * @pages: pointer to the list of pages that would be returned to the caller.
+ * @max_req_pages: max number of requested pages.
+ *
+ * Driver must call this function to properly de-allocate a previous enlisted
+ * balloon pages before definitively releasing it back to the guest system.
+ * This function tries to remove @max_req_pages continuous pages from the ballooned
+ * pages and return them to the caller in the @pages list.
+ *
+ * Note that this function may fail to dequeue some pages even if the balloon
+ * isn't empty - since the page list can be temporarily empty due to compaction
+ * of isolated pages.
+ *
+ * Return: number of pages that were added to the @pages list.
+ */
+size_t balloon_page_list_dequeue_cont(struct balloon_dev_info *b_dev_info,
+				      struct list_head *pages, struct page **first_page,
+				      size_t max_req_pages)
+{
+	struct page *page, *tmp;
+	unsigned long flags, tail_pfn;
+	size_t n_pages = 0;
+	bool got_first = false;
+
+	spin_lock_irqsave(&b_dev_info->pages_lock, flags);
+	list_for_each_entry_safe_reverse(page, tmp, &b_dev_info->pages, lru) {
+		unsigned long pfn;
+
+		if (n_pages == max_req_pages)
+			break;
+
+		pfn = page_to_pfn(page);
+
+		if (got_first && pfn != tail_pfn + 1)
+			break;
+
+		/*
+		 * Block others from accessing the 'page' while we get around to
+		 * establishing additional references and preparing the 'page'
+		 * to be released by the balloon driver.
+		 */
+		if (!trylock_page(page)) {
+			if (!got_first)
+				continue;
+			else
+				break;
+		}
+
+		if (IS_ENABLED(CONFIG_BALLOON_COMPACTION) && PageIsolated(page)) {
+			/* raced with isolation */
+			unlock_page(page);
+			if (!got_first)
+				continue;
+			else
+				break;
+		}
+		balloon_page_delete(page);
+		__count_vm_event(BALLOON_DEFLATE);
+		list_add(&page->lru, pages);
+		unlock_page(page);
+		n_pages++;
+		tail_pfn = pfn;
+		if (!got_first) {
+			got_first = true;
+			*first_page = page;
+		}
+	}
+	spin_unlock_irqrestore(&b_dev_info->pages_lock, flags);
+
+	return n_pages;
+}
+EXPORT_SYMBOL_GPL(balloon_page_list_dequeue_cont);
+
 /*
  * balloon_pages_alloc - allocates a new page for insertion into the balloon
  *			 page list.
