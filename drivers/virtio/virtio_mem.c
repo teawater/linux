@@ -23,6 +23,9 @@
 
 #include <acpi/acpi_numa.h>
 
+#include <linux/proc_fs.h>
+#include <linux/seq_file.h>
+
 static bool unplug_online = true;
 module_param(unplug_online, bool, 0644);
 MODULE_PARM_DESC(unplug_online, "Try to unplug online memory");
@@ -1628,6 +1631,23 @@ static int virtio_mem_init_vq(struct virtio_mem *vm)
 	return 0;
 }
 
+static int proc_virtio_mem_write(struct seq_file *seq, void *v)
+{
+	struct virtio_mem *vm = seq->private;
+	char  *vaddr;
+	uint64_t offset;
+
+	for (offset = 0; offset < vm->region_size; offset += PAGE_SIZE) {
+		vaddr = (__force void *)ioremap_cache(vm->addr + offset, PAGE_SIZE);
+		vaddr[0] = 1;
+		iounmap((void __iomem *)vaddr);
+	}
+
+	seq_printf(seq, "%p\n", (void *)vm->addr);
+
+	return 0;
+}
+
 static int virtio_mem_init(struct virtio_mem *vm)
 {
 	const uint64_t phys_limit = 1UL << MAX_PHYSMEM_BITS;
@@ -1709,6 +1729,9 @@ static int virtio_mem_init(struct virtio_mem *vm)
 		 (unsigned long long)vm->subblock_size);
 	if (vm->nid != NUMA_NO_NODE)
 		dev_info(&vm->vdev->dev, "nid: %d", vm->nid);
+
+	proc_create_single_data("virtio_mem", 0, NULL,
+				proc_virtio_mem_write, (void *)vm);
 
 	return 0;
 }
