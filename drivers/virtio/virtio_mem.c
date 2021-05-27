@@ -189,6 +189,25 @@ struct virtio_mem {
 			 * in one 4 KiB page.
 			 */
 			unsigned long *sb_states;
+
+			/*
+			 * True if allocate its internal metadata
+			 * (struct pages) from the hotadded memory.
+			 * See memory_hotplug.memmap_on_memory to get
+			 * more detailed info.
+			 */
+			//bool memmap_on_memory;
+
+			/*
+			 * If memmap_on_memory is true, nr_vmemmap_pages
+			 * is the vmemmap pages number of current memory
+			 * block.
+			 * nr_vmemmap_pages will be initialized to 0 and
+			 * be setup in virtio_mem_memory_notifier_cb.
+			 */
+			unsigned long nr_vmemmap_pages;
+
+			uint32_t sbs_vmemmap;
 		} sbm;
 
 		struct {
@@ -545,7 +564,9 @@ static bool virtio_mem_sbm_test_sb_unplugged(struct virtio_mem *vm,
 static int virtio_mem_sbm_first_unplugged_sb(struct virtio_mem *vm,
 					    unsigned long mb_id)
 {
-	const int bit = virtio_mem_sbm_sb_state_bit_nr(vm, mb_id, 0);
+	const int bit =
+		virtio_mem_sbm_sb_state_bit_nr(vm, mb_id,
+					       vm->sbm.sbs_vmemmap);
 
 	return find_next_zero_bit(vm->sbm.sb_states,
 				  bit + vm->sbm.sbs_per_mb, bit) - bit;
@@ -603,9 +624,10 @@ static bool virtio_mem_could_add_memory(struct virtio_mem *vm, uint64_t size)
  * Will not modify the state of memory blocks in virtio-mem.
  */
 static int virtio_mem_add_memory(struct virtio_mem *vm, uint64_t addr,
-				 uint64_t size)
+				 uint64_t size, bool memmap_on_memory)
 {
 	int rc;
+	mhp_t mhp_flags = MHP_MERGE_RESOURCE;
 
 	/*
 	 * When force-unloading the driver and we still have memory added to
@@ -622,8 +644,10 @@ static int virtio_mem_add_memory(struct virtio_mem *vm, uint64_t addr,
 		addr + size - 1);
 	/* Memory might get onlined immediately. */
 	atomic64_add(size, &vm->offline_size);
+	if (memmap_on_memory)
+		mhp_flags |= MHP_MEMMAP_ON_MEMORY;
 	rc = add_memory_driver_managed(vm->nid, addr, size, vm->resource_name,
-				       MHP_MERGE_RESOURCE);
+				       mhp_flags);
 	if (rc) {
 		atomic64_sub(size, &vm->offline_size);
 		dev_warn(&vm->vdev->dev, "adding memory failed: %d\n", rc);
@@ -643,7 +667,8 @@ static int virtio_mem_sbm_add_mb(struct virtio_mem *vm, unsigned long mb_id)
 	const uint64_t addr = virtio_mem_mb_id_to_phys(mb_id);
 	const uint64_t size = memory_block_size_bytes();
 
-	return virtio_mem_add_memory(vm, addr, size);
+	return virtio_mem_add_memory(vm, addr, size,
+				     vm->sbm.sbs_vmemmap > 0);
 }
 
 /*
@@ -654,7 +679,7 @@ static int virtio_mem_bbm_add_bb(struct virtio_mem *vm, unsigned long bb_id)
 	const uint64_t addr = virtio_mem_bb_id_to_phys(vm, bb_id);
 	const uint64_t size = vm->bbm.bb_size;
 
-	return virtio_mem_add_memory(vm, addr, size);
+	return virtio_mem_add_memory(vm, addr, size, false);
 }
 
 /*
@@ -871,7 +896,23 @@ static void virtio_mem_sbm_notify_going_offline(struct virtio_mem *vm,
 	unsigned long pfn;
 	int sb_id;
 
-	for (sb_id = 0; sb_id < vm->sbm.sbs_per_mb; sb_id++) {
+	if (vm->sbm.sbs_vmemmap) {
+		unsigned long other_pages
+				= vm->sbm.sbs_vmemmap * nr_pages -
+				  vm->sbm.nr_vmemmap_pages;
+
+		if (other_pages) {
+			unsigned long other_pfn
+				= PFN_DOWN(virtio_mem_mb_id_to_phys(mb_id)) +
+				  vm->sbm.nr_vmemmap_pages;
+
+			virtio_mem_fake_offline_going_offline(other_pfn,
+							      other_pages);
+		}
+	}
+
+	for (sb_id = vm->sbm.sbs_vmemmap;
+	     sb_id < vm->sbm.sbs_per_mb; sb_id++) {
 		if (virtio_mem_sbm_test_sb_plugged(vm, mb_id, sb_id, 1))
 			continue;
 		pfn = PFN_DOWN(virtio_mem_mb_id_to_phys(mb_id) +
@@ -887,7 +928,23 @@ static void virtio_mem_sbm_notify_cancel_offline(struct virtio_mem *vm,
 	unsigned long pfn;
 	int sb_id;
 
-	for (sb_id = 0; sb_id < vm->sbm.sbs_per_mb; sb_id++) {
+	if (vm->sbm.sbs_vmemmap) {
+		unsigned long other_pages
+				= vm->sbm.sbs_vmemmap * nr_pages -
+				  vm->sbm.nr_vmemmap_pages;
+
+		if (other_pages) {
+			unsigned long other_pfn
+				= PFN_DOWN(virtio_mem_mb_id_to_phys(mb_id)) +
+				  vm->sbm.nr_vmemmap_pages;
+
+			virtio_mem_fake_offline_cancel_offline(other_pfn,
+							       other_pages);
+		}
+	}
+
+	for (sb_id = vm->sbm.sbs_vmemmap;
+	     sb_id < vm->sbm.sbs_per_mb; sb_id++) {
 		if (virtio_mem_sbm_test_sb_plugged(vm, mb_id, sb_id, 1))
 			continue;
 		pfn = PFN_DOWN(virtio_mem_mb_id_to_phys(mb_id) +
@@ -933,8 +990,8 @@ static int virtio_mem_memory_notifier_cb(struct notifier_block *nb,
 	struct virtio_mem *vm = container_of(nb, struct virtio_mem,
 					     memory_notifier);
 	struct memory_notify *mhp = arg;
-	const unsigned long start = PFN_PHYS(mhp->start_pfn);
-	const unsigned long size = PFN_PHYS(mhp->nr_pages);
+	unsigned long start = PFN_PHYS(mhp->start_pfn);
+	unsigned long size = PFN_PHYS(mhp->nr_pages);
 	int rc = NOTIFY_OK;
 	unsigned long id;
 
@@ -942,6 +999,27 @@ static int virtio_mem_memory_notifier_cb(struct notifier_block *nb,
 		return NOTIFY_DONE;
 
 	if (vm->in_sbm) {
+		dev_info(&vm->vdev->dev, "cb 1 action %lx, %lx, %lx\n", action, start, size);
+		if (vm->sbm.nr_vmemmap_pages) {
+			unsigned long vmemmap_size = vm->sbm.nr_vmemmap_pages;
+
+			/*if (!vmemmap_size) {
+				uint64_t current_offline_threshold;
+				vmemmap_size = walk_memory_blocks(start, size,
+						NULL,
+						get_nr_vmemmap_pages_cb);
+				if (WARN_ON_ONCE(!vmemmap_size))
+					return NOTIFY_BAD;
+				vm->sbm.nr_vmemmap_pages = vmemmap_size;
+				dev_info(&vm->vdev->dev,
+					 "nr vmemmap pages: %lu",
+					 vm->sbm.nr_vmemmap_pages);
+			}*/
+			vmemmap_size <<= PAGE_SHIFT;
+			start -= vmemmap_size;
+			size += vmemmap_size;
+		}
+		dev_info(&vm->vdev->dev, "cb 2 action %lx, %lx, %lx\n", action, start, size);
 		id = virtio_mem_phys_to_mb_id(start);
 		/*
 		 * In SBM, we add memory in separate memory blocks - we expect
@@ -1227,7 +1305,10 @@ static void virtio_mem_online_page_cb(struct page *page, unsigned int order)
 			 */
 			id = virtio_mem_phys_to_mb_id(addr);
 			sb_id = virtio_mem_phys_to_sb_id(vm, addr);
-			do_online = virtio_mem_sbm_test_sb_plugged(vm, id,
+			if (sb_id < vm->sbm.sbs_vmemmap)
+				do_online = false;
+			else
+				do_online = virtio_mem_sbm_test_sb_plugged(vm, id,
 								   sb_id, 1);
 		} else {
 			/*
@@ -1243,6 +1324,7 @@ static void virtio_mem_online_page_cb(struct page *page, unsigned int order)
 		else
 			virtio_mem_set_fake_offline(PFN_DOWN(addr), 1 << order,
 						    false);
+out:
 		rcu_read_unlock();
 		return;
 	}
@@ -1340,6 +1422,7 @@ static int virtio_mem_send_unplug_request(struct virtio_mem *vm, uint64_t addr,
 	switch (virtio_mem_send_request(vm, &req)) {
 	case VIRTIO_MEM_RESP_ACK:
 		vm->plugged_size -= size;
+		dev_warn(&vm->vdev->dev, "virtio_mem_send_unplug_request %llx s %llx", vm->plugged_size, size);
 		return 0;
 	case VIRTIO_MEM_RESP_BUSY:
 		rc = -ETXTBSY;
@@ -1462,14 +1545,14 @@ static int virtio_mem_sbm_unplug_any_sb(struct virtio_mem *vm,
 	sb_id = vm->sbm.sbs_per_mb - 1;
 	while (*nb_sb) {
 		/* Find the next candidate subblock */
-		while (sb_id >= 0 &&
+		while (sb_id >= vm->sbm.sbs_vmemmap &&
 		       virtio_mem_sbm_test_sb_unplugged(vm, mb_id, sb_id, 1))
 			sb_id--;
-		if (sb_id < 0)
+		if (sb_id < vm->sbm.sbs_vmemmap)
 			break;
 		/* Try to unplug multiple subblocks at a time */
 		count = 1;
-		while (count < *nb_sb && sb_id > 0 &&
+		while (count < *nb_sb && sb_id > vm->sbm.sbs_vmemmap &&
 		       virtio_mem_sbm_test_sb_plugged(vm, mb_id, sb_id - 1, 1)) {
 			count++;
 			sb_id--;
@@ -1494,7 +1577,7 @@ static int virtio_mem_sbm_unplug_any_sb(struct virtio_mem *vm,
  */
 static int virtio_mem_sbm_unplug_mb(struct virtio_mem *vm, unsigned long mb_id)
 {
-	uint64_t nb_sb = vm->sbm.sbs_per_mb;
+	uint64_t nb_sb = vm->sbm.sbs_per_mb - vm->sbm.sbs_vmemmap;
 
 	return virtio_mem_sbm_unplug_any_sb(vm, mb_id, &nb_sb);
 }
@@ -1534,11 +1617,14 @@ static int virtio_mem_sbm_prepare_next_mb(struct virtio_mem *vm,
 static int virtio_mem_sbm_plug_and_add_mb(struct virtio_mem *vm,
 					  unsigned long mb_id, uint64_t *nb_sb)
 {
-	const int count = min_t(int, *nb_sb, vm->sbm.sbs_per_mb);
+	int count = min_t(int, *nb_sb, vm->sbm.sbs_per_mb);
 	int rc;
 
 	if (WARN_ON_ONCE(!count))
 		return -EINVAL;
+
+	if (vm->sbm.sbs_vmemmap)
+		count = max_t(int, count, vm->sbm.sbs_vmemmap);
 
 	/*
 	 * Plug the requested number of subblocks before adding it to linux,
@@ -1570,7 +1656,10 @@ static int virtio_mem_sbm_plug_and_add_mb(struct virtio_mem *vm,
 		return rc;
 	}
 
-	*nb_sb -= count;
+	if (*nb_sb >= count)
+		*nb_sb -= count;
+	else
+		*nb_sb = 0;
 	return 0;
 }
 
@@ -1617,7 +1706,10 @@ static int virtio_mem_sbm_plug_any_sb(struct virtio_mem *vm,
 		virtio_mem_fake_online(pfn, nr_pages);
 	}
 
-	if (virtio_mem_sbm_test_sb_plugged(vm, mb_id, 0, vm->sbm.sbs_per_mb)) {
+	if (virtio_mem_sbm_test_sb_plugged(vm, mb_id,
+					   vm->sbm.sbs_vmemmap,
+					   vm->sbm.sbs_per_mb -
+					   vm->sbm.sbs_vmemmap)) {
 		if (online)
 			virtio_mem_sbm_set_mb_state(vm, mb_id,
 						    VIRTIO_MEM_SBM_MB_ONLINE);
@@ -1820,13 +1912,17 @@ static int virtio_mem_sbm_unplug_any_sb_offline(struct virtio_mem *vm,
 	rc = virtio_mem_sbm_unplug_any_sb(vm, mb_id, nb_sb);
 
 	/* some subblocks might have been unplugged even on failure */
-	if (!virtio_mem_sbm_test_sb_plugged(vm, mb_id, 0, vm->sbm.sbs_per_mb))
+	if (!virtio_mem_sbm_test_sb_plugged(vm, mb_id, vm->sbm.sbs_vmemmap,
+					    vm->sbm.sbs_per_mb -
+					    vm->sbm.sbs_vmemmap))
 		virtio_mem_sbm_set_mb_state(vm, mb_id,
 					    VIRTIO_MEM_SBM_MB_OFFLINE_PARTIAL);
 	if (rc)
 		return rc;
 
-	if (virtio_mem_sbm_test_sb_unplugged(vm, mb_id, 0, vm->sbm.sbs_per_mb)) {
+	if (virtio_mem_sbm_test_sb_unplugged(vm, mb_id, vm->sbm.sbs_vmemmap,
+					     vm->sbm.sbs_per_mb -
+					     vm->sbm.sbs_vmemmap)) {
 		/*
 		 * Remove the block from Linux - this should never fail.
 		 * Hinder the block from getting onlined by marking it
@@ -1840,6 +1936,23 @@ static int virtio_mem_sbm_unplug_any_sb_offline(struct virtio_mem *vm,
 		rc = virtio_mem_sbm_remove_mb(vm, mb_id);
 		BUG_ON(rc);
 		mutex_lock(&vm->hotplug_mutex);
+
+		/* Remove vmemmap pages. */
+		if (vm->sbm.sbs_vmemmap) {
+			rc = virtio_mem_sbm_unplug_sb(vm, mb_id, 0,
+						      vm->sbm.sbs_vmemmap);
+			/*
+			 * Just warn because this error will
+			 * not affect next plug.
+			 */
+			WARN_ON(rc);
+			if (!rc) {
+				if (*nb_sb >= vm->sbm.sbs_vmemmap)
+					*nb_sb -= vm->sbm.sbs_vmemmap;
+				else
+					*nb_sb = 0;
+			}
+		}
 	}
 	return 0;
 }
@@ -1894,19 +2007,24 @@ static int virtio_mem_sbm_unplug_any_sb_online(struct virtio_mem *vm,
 	int rc, sb_id;
 
 	/* If possible, try to unplug the complete block in one shot. */
-	if (*nb_sb >= vm->sbm.sbs_per_mb &&
-	    virtio_mem_sbm_test_sb_plugged(vm, mb_id, 0, vm->sbm.sbs_per_mb)) {
-		rc = virtio_mem_sbm_unplug_sb_online(vm, mb_id, 0,
-						     vm->sbm.sbs_per_mb);
+	if (*nb_sb >= (vm->sbm.sbs_per_mb - vm->sbm.sbs_vmemmap) &&
+	    virtio_mem_sbm_test_sb_plugged(vm, mb_id, vm->sbm.sbs_vmemmap,
+	    				   vm->sbm.sbs_per_mb -
+					   vm->sbm.sbs_vmemmap)) {
+		rc = virtio_mem_sbm_unplug_sb_online(vm, mb_id,
+						     vm->sbm.sbs_vmemmap,
+						     vm->sbm.sbs_per_mb -
+						     vm->sbm.sbs_vmemmap);
 		if (!rc) {
-			*nb_sb -= vm->sbm.sbs_per_mb;
+			*nb_sb -= (vm->sbm.sbs_per_mb - vm->sbm.sbs_vmemmap);
 			goto unplugged;
 		} else if (rc != -EBUSY)
 			return rc;
 	}
 
 	/* Fallback to single subblocks. */
-	for (sb_id = vm->sbm.sbs_per_mb - 1; sb_id >= 0 && *nb_sb; sb_id--) {
+	for (sb_id = vm->sbm.sbs_per_mb - 1;
+	     sb_id >= vm->sbm.sbs_vmemmap && *nb_sb; sb_id--) {
 		/* Find the next candidate subblock */
 		while (sb_id >= 0 &&
 		       !virtio_mem_sbm_test_sb_plugged(vm, mb_id, sb_id, 1))
@@ -1928,13 +2046,31 @@ unplugged:
 	 * remove it. This will usually not fail, as no memory is in use
 	 * anymore - however some other notifiers might NACK the request.
 	 */
-	if (virtio_mem_sbm_test_sb_unplugged(vm, mb_id, 0, vm->sbm.sbs_per_mb)) {
+	if (virtio_mem_sbm_test_sb_unplugged(vm, mb_id, vm->sbm.sbs_vmemmap,
+				vm->sbm.sbs_per_mb - vm->sbm.sbs_vmemmap)) {
 		mutex_unlock(&vm->hotplug_mutex);
 		rc = virtio_mem_sbm_offline_and_remove_mb(vm, mb_id);
 		mutex_lock(&vm->hotplug_mutex);
-		if (!rc)
+		if (!rc) {
 			virtio_mem_sbm_set_mb_state(vm, mb_id,
 						    VIRTIO_MEM_SBM_MB_UNUSED);
+			/* Remove vmemmap pages. */
+			if (vm->sbm.sbs_vmemmap) {
+				rc = virtio_mem_sbm_unplug_sb(vm, mb_id, 0,
+							vm->sbm.sbs_vmemmap);
+				/*
+				 * Just warn because this error will
+				 * not affect next plug.
+				 */
+				WARN_ON(rc);
+				if (!rc) {
+					if (*nb_sb >= vm->sbm.sbs_vmemmap)
+						*nb_sb -= vm->sbm.sbs_vmemmap;
+					else
+						*nb_sb = 0;
+				}
+			}
+		}
 	}
 
 	return 0;
@@ -2444,6 +2580,16 @@ static int virtio_mem_init(struct virtio_mem *vm)
 		       memory_block_size_bytes() - 1;
 		vm->sbm.first_mb_id = virtio_mem_phys_to_mb_id(addr);
 		vm->sbm.next_mb_id = vm->sbm.first_mb_id;
+		if (mhp_supports_memmap_on_memory(memory_block_size_bytes())) {
+			vm->sbm.nr_vmemmap_pages = ((memory_block_size_bytes() >>
+						     PAGE_SHIFT) *
+						    sizeof(struct page)) >> 
+						   PAGE_SHIFT;
+			vm->sbm.sbs_vmemmap
+				= ALIGN(vm->sbm.nr_vmemmap_pages << PAGE_SHIFT,
+					vm->sbm.sb_size) /
+				  vm->sbm.sb_size;
+		}
 	} else {
 		/* BBM: At least one Linux memory block. */
 		vm->bbm.bb_size = max_t(uint64_t, vm->device_block_size,
@@ -2481,10 +2627,17 @@ static int virtio_mem_init(struct virtio_mem *vm)
 		 (unsigned long long)vm->device_block_size);
 	dev_info(&vm->vdev->dev, "memory block size: 0x%lx",
 		 memory_block_size_bytes());
-	if (vm->in_sbm)
+	if (vm->in_sbm) {
 		dev_info(&vm->vdev->dev, "subblock size: 0x%llx",
 			 (unsigned long long)vm->sbm.sb_size);
-	else
+		if (vm->sbm.sbs_vmemmap) {
+			dev_info(&vm->vdev->dev, "nr vmemmap pages: %lu",
+				 vm->sbm.nr_vmemmap_pages);
+			dev_info(&vm->vdev->dev, \
+		"The number of vmemmap subblocks per Linux memory block: %u",
+				 vm->sbm.sbs_vmemmap);
+		}
+	} else
 		dev_info(&vm->vdev->dev, "big block size: 0x%llx",
 			 (unsigned long long)vm->bbm.bb_size);
 	if (vm->nid != NUMA_NO_NODE && IS_ENABLED(CONFIG_NUMA))

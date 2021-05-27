@@ -316,6 +316,8 @@ static inline void pgdat_resize_unlock(struct pglist_data *p, unsigned long *f) 
 static inline void pgdat_resize_init(struct pglist_data *pgdat) {}
 #endif /* !(CONFIG_MEMORY_HOTPLUG || CONFIG_DEFERRED_STRUCT_PAGE_INIT) */
 
+extern int get_nr_vmemmap_pages_cb(struct memory_block *mem, void *arg);
+
 #ifdef CONFIG_MEMORY_HOTREMOVE
 
 extern void try_offline_node(int nid);

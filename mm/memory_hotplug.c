@@ -1416,6 +1416,14 @@ bool mhp_range_allowed(u64 start, u64 size, bool need_mapping)
 	return false;
 }
 
+int get_nr_vmemmap_pages_cb(struct memory_block *mem, void *arg)
+{
+	/*
+	 * If not set, continue with the next block.
+	 */
+	return mem->nr_vmemmap_pages;
+}
+
 #ifdef CONFIG_MEMORY_HOTREMOVE
 /*
  * Confirm all pages in a range [start, end) belong to the same zone (skipping
@@ -1880,14 +1888,6 @@ static int check_memblock_offlined_cb(struct memory_block *mem, void *arg)
 		return -EBUSY;
 	}
 	return 0;
-}
-
-static int get_nr_vmemmap_pages_cb(struct memory_block *mem, void *arg)
-{
-	/*
-	 * If not set, continue with the next block.
-	 */
-	return mem->nr_vmemmap_pages;
 }
 
 static int check_cpu_on_node(pg_data_t *pgdat)
