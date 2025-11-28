@@ -321,6 +321,10 @@ struct mem_cgroup {
 	spinlock_t event_list_lock;
 #endif /* CONFIG_MEMCG_V1 */
 
+#ifdef CONFIG_BPF_SYSCALL
+	struct memcg_bpf_ops *bpf_ops;
+#endif
+
 	struct mem_cgroup_per_node *nodeinfo[];
 };
 
