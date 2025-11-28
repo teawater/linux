@@ -107,7 +107,7 @@ obj-$(CONFIG_MEMCG) += swap_cgroup.o
 endif
 ifdef CONFIG_BPF_SYSCALL
 obj-y += bpf_oom.o
-obj-$(CONFIG_MEMCG) += bpf_memcontrol.o
+obj-$(CONFIG_MEMCG) += bpf_memcontrol.o memcontrol_bpf.o
 endif
 obj-$(CONFIG_CGROUP_HUGETLB) += hugetlb_cgroup.o
 obj-$(CONFIG_GUP_TEST) += gup_test.o

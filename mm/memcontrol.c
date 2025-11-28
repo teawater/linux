@@ -69,6 +69,7 @@
 #include <net/ip.h>
 #include "slab.h"
 #include "memcontrol-v1.h"
+#include "memcontrol_bpf.h"
 
 #include <linux/uaccess.h>
 
@@ -2038,7 +2039,8 @@ static unsigned long reclaim_high(struct mem_cgroup *memcg,
 		unsigned long pflags;
 
 		if (page_counter_read(&memcg->memory) <=
-		    READ_ONCE(memcg->memory.high))
+		    READ_ONCE(memcg->memory.high) &&
+		    !bpf_memcg_nr_pages_over_high(memcg))
 			continue;
 
 		memcg_memory_event(memcg, MEMCG_HIGH);
@@ -2116,11 +2118,12 @@ static void high_work_func(struct work_struct *work)
  #define MEMCG_DELAY_PRECISION_SHIFT 20
  #define MEMCG_DELAY_SCALING_SHIFT 14
 
-static u64 calculate_overage(unsigned long usage, unsigned long high)
+static u64 calculate_overage(unsigned long usage, unsigned long high,
+			     unsigned long bpf_over_high)
 {
 	u64 overage;
 
-	if (usage <= high)
+	if (!bpf_over_high && usage <= high)
 		return 0;
 
 	/*
@@ -2130,6 +2133,7 @@ static u64 calculate_overage(unsigned long usage, unsigned long high)
 	high = max(high, 1UL);
 
 	overage = usage - high;
+	overage = max(overage, bpf_over_high);
 	overage <<= MEMCG_DELAY_PRECISION_SHIFT;
 	return div64_u64(overage, high);
 }
@@ -2140,7 +2144,8 @@ static u64 mem_find_max_overage(struct mem_cgroup *memcg)
 
 	do {
 		overage = calculate_overage(page_counter_read(&memcg->memory),
-					    READ_ONCE(memcg->memory.high));
+					    READ_ONCE(memcg->memory.high),
+					    bpf_memcg_nr_pages_over_high(memcg));
 		max_overage = max(overage, max_overage);
 	} while ((memcg = parent_mem_cgroup(memcg)) &&
 		 !mem_cgroup_is_root(memcg));
@@ -2154,7 +2159,7 @@ static u64 swap_find_max_overage(struct mem_cgroup *memcg)
 
 	do {
 		overage = calculate_overage(page_counter_read(&memcg->swap),
-					    READ_ONCE(memcg->swap.high));
+					    READ_ONCE(memcg->swap.high), 0);
 		if (overage)
 			memcg_memory_event(memcg, MEMCG_SWAP_HIGH);
 		max_overage = max(overage, max_overage);
@@ -2210,12 +2215,14 @@ void __mem_cgroup_handle_over_high(gfp_t gfp_mask)
 	unsigned long penalty_jiffies;
 	unsigned long pflags;
 	unsigned long nr_reclaimed;
-	unsigned int nr_pages = current->memcg_nr_pages_over_high;
+	unsigned int nr_pages;
 	int nr_retries = MAX_RECLAIM_RETRIES;
 	struct mem_cgroup *memcg;
 	bool in_retry = false;
 
 	memcg = get_mem_cgroup_from_mm(current->mm);
+	nr_pages = max(current->memcg_nr_pages_over_high,
+		       bpf_memcg_nr_pages_over_high(memcg));
 	current->memcg_nr_pages_over_high = 0;
 
 retry_reclaim:
@@ -2309,6 +2316,7 @@ static int try_charge_memcg(struct mem_cgroup *memcg, gfp_t gfp_mask,
 	bool raised_max_event = false;
 	unsigned long pflags;
 	bool allow_spinning = gfpflags_allow_spinning(gfp_mask);
+	struct mem_cgroup *orig_memcg;
 
 retry:
 	if (consume_stock(memcg, nr_pages))
@@ -2434,6 +2442,7 @@ done_restock:
 	if (batch > nr_pages)
 		refill_stock(memcg, batch - nr_pages);
 
+	orig_memcg = memcg;
 	/*
 	 * If the hierarchy is above the normal consumption range, schedule
 	 * reclaim on returning to userland.  We can perform reclaim here
@@ -2483,7 +2492,8 @@ done_restock:
 	 * kernel. If this is successful, the return path will see it
 	 * when it rechecks the overage and simply bail out.
 	 */
-	if (current->memcg_nr_pages_over_high > MEMCG_CHARGE_BATCH &&
+	if ((current->memcg_nr_pages_over_high > MEMCG_CHARGE_BATCH ||
+	     bpf_memcg_nr_pages_over_high(orig_memcg) > MEMCG_CHARGE_BATCH) &&
 	    !(current->flags & PF_MEMALLOC) &&
 	    gfpflags_allow_blocking(gfp_mask))
 		__mem_cgroup_handle_over_high(gfp_mask);
@@ -3867,6 +3877,8 @@ static int mem_cgroup_css_online(struct cgroup_subsys_state *css)
 	 */
 	xa_store(&mem_cgroup_ids, memcg->id.id, memcg, GFP_KERNEL);
 
+	memcontrol_bpf_online(memcg);
+
 	return 0;
 offline_kmem:
 	memcg_offline_kmem(memcg);
@@ -3887,6 +3899,7 @@ static void mem_cgroup_css_offline(struct cgroup_subsys_state *css)
 	zswap_memcg_offline_cleanup(memcg);
 
 	bpf_oom_memcg_offline(memcg);
+	memcontrol_bpf_offline(memcg);
 	memcg_offline_kmem(memcg);
 	reparent_shrinker_deferred(memcg);
 	wb_memcg_offline(memcg);

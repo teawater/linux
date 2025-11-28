@@ -229,6 +229,8 @@ struct mem_cgroup {
 
 #ifdef CONFIG_BPF_SYSCALL
 	struct bpf_oom_ops *bpf_oom;
+
+	struct memcg_bpf_ops *bpf_ops;
 #endif
 
 	int swappiness;
