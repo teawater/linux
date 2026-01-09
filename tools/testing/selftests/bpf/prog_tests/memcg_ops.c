@@ -5,6 +5,10 @@
 
 #include <test_progs.h>
 #include <bpf/btf.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
 #include "cgroup_helpers.h"
 
 struct local_config {
@@ -17,15 +21,14 @@ struct local_config {
 
 #define OVER_HIGH_THRESHOLD 1
 #define OVER_HIGH_MS 2000
-#define FILE_SIZE (48 * 1024 * 1024ul)
-#define BUFFER_SIZE (128 * 1024)
+#define FILE_SIZE (64 * 1024 * 1024ul)
+#define BUFFER_SIZE (4096)
 #define READ_ITERATIONS 5
-#define CG_LIMIT (16 * 1024 * 1024ul)
+#define CG_LIMIT (120 * 1024 * 1024ul)
 
 #define CG_DIR "/memcg_ops_test"
 #define CG_HIGH_DIR CG_DIR "/high"
 #define CG_LOW_DIR CG_DIR "/low"
-
 
 static int setup_cgroup(int *high_cgroup_id, int *low_cgroup_fd)
 {
@@ -45,7 +48,10 @@ static int setup_cgroup(int *high_cgroup_id, int *low_cgroup_fd)
 		goto cleanup;
 	snprintf(limit_buf, 20, "%ld", CG_LIMIT);
 	ret = write_cgroup_file(CG_DIR, "memory.max", limit_buf);
-	if (!ASSERT_OK(ret, "write_cgroup_file"))
+	if (!ASSERT_OK(ret, "write_cgroup_file memory.max"))
+		goto cleanup;
+	ret = write_cgroup_file(CG_DIR, "memory.swap.max", "0");
+	if (!ASSERT_OK(ret, "write_cgroup_file memory.swap.max"))
 		goto cleanup;
 
 	ret = create_and_get_cgroup(CG_HIGH_DIR);
@@ -108,34 +114,48 @@ out:
 int read_file(const char *filename, int iterations)
 {
 	int ret = -1;
-	char *buffer;
+	long page_size = sysconf(_SC_PAGESIZE);
+	volatile char *p;
+	char *map;
+	size_t i;
+	int fd;
+	struct stat sb;
 
-	buffer = malloc(BUFFER_SIZE);
-	if (!buffer)
+	fd = open(filename, O_RDONLY);
+	if (fd == -1)
 		goto out;
 
-	for (int iter = 0; iter < iterations; iter++) {
-		FILE *fp = fopen(filename, "rb");
+	if (fstat(fd, &sb) == -1)
+		goto cleanup_fd;
 
-		if (!fp)
-			goto cleanup;
-
-		size_t total_read = 0;
-		size_t bytes_read;
-
-		while ((bytes_read = fread(buffer, 1, BUFFER_SIZE, fp)) > 0)
-			total_read += bytes_read;
-
-		fclose(fp);
-
-		if (env.verbosity >= VERBOSE_NORMAL)
-			printf("%s %d %d done\n",
-				__func__, getpid(), iter);
+	if (sb.st_size != FILE_SIZE) {
+		fprintf(stderr, "File size mismatch: expected %ld, got %ld\n",
+			FILE_SIZE, sb.st_size);
+		goto cleanup_fd;
 	}
 
+	map = mmap(NULL, FILE_SIZE, PROT_READ, MAP_PRIVATE, fd, 0);
+	if (map == MAP_FAILED)
+		goto cleanup_fd;
+
+	for (int iter = 0; iter < iterations; iter++) {
+		for (i = 0; i < FILE_SIZE; i += page_size) {
+			/* access a byte to trigger page fault */
+			p = &map[i];
+			(void)*p;
+		}
+
+		if (env.verbosity >= VERBOSE_NORMAL)
+			printf("%s %d %d done\n", __func__, getpid(), iter);
+	}
+
+	if (munmap(map, FILE_SIZE) == -1)
+		goto cleanup_fd;
+
 	ret = 0;
-cleanup:
-	free(buffer);
+
+cleanup_fd:
+	close(fd);
 out:
 	return ret;
 }
