@@ -19,7 +19,7 @@
 
 #define ARRAY_SIZE(x) (sizeof(x) / sizeof((x)[0]))
 
-//#include "afm.skel.h"
+#include "afp.skel.h"
 
 static bool exiting;
 
@@ -156,6 +156,7 @@ int main(int argc, char **argv)
 	char *path = NULL;
 	char hr[32];
 	int opt, err;
+	struct afp_bpf *skel;
 
 	while ((opt = getopt_long(argc, argv, "p:l:h",
 				  long_opts, NULL)) != -1) {
@@ -188,6 +189,23 @@ int main(int argc, char **argv)
 	if (!cgroup_id)
 		return -EINVAL;
 
+	skel = afp_bpf__open();
+	if (!skel) {
+		fprintf(stderr, "Failed to open BPF skeleton\n");
+		return -EINVAL;
+	}
+	err = afp_bpf__load(skel);
+	if (err) {
+		fprintf(stderr, "Failed to load BPF skeleton: %d\n", err);
+		goto cleanup;
+	}
+
+	err = afp_bpf__attach(skel);
+	if (err) {
+		fprintf(stderr, "Failed to attach BPF programs: %d\n", err);
+		goto cleanup;
+	}
+
 	printf("Successfully attached!\n");
 
 	signal(SIGINT, sig_handler);
@@ -198,6 +216,7 @@ int main(int argc, char **argv)
 
 	printf("Exiting...\n");
 
-out:
+cleanup:
+	afp_bpf__destroy(skel);
 	return err;
 }
