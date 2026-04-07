@@ -17,7 +17,16 @@
 #include <bpf/bpf.h>
 #include <bpf/libbpf.h>
 
+#ifndef __MEMCG_RSTAT_SIMPLE_BPF_SKEL_H__
+#define u64 uint64_t
+#endif
+
 #define ARRAY_SIZE(x) (sizeof(x) / sizeof((x)[0]))
+
+struct bpf_args_s {
+	u64 cgroup_id;
+	u64 limit_bytes;
+};
 
 #include "afp.skel.h"
 
@@ -151,12 +160,15 @@ int main(int argc, char **argv)
 		{ NULL,    0,                 NULL,  0  }
 	};
 
-	uint64_t cgroup_id, limit_bytes;
 	char *limit_str = NULL;
 	char *path = NULL;
 	char hr[32];
 	int opt, err;
+	struct bpf_args_s bpf_args;
 	struct afp_bpf *skel;
+	int prog_init_fd;
+
+	LIBBPF_OPTS(bpf_test_run_opts, run_opts);
 
 	while ((opt = getopt_long(argc, argv, "p:l:h",
 				  long_opts, NULL)) != -1) {
@@ -182,12 +194,16 @@ int main(int argc, char **argv)
 		return -EINVAL;
 	}
 
-	err = parse_size(limit_str, &limit_bytes);
+	err = parse_size(limit_str, &bpf_args.limit_bytes);
 	if (err)
 		return err;
-	cgroup_id = get_cgroup_id(path);
-	if (!cgroup_id)
+	bpf_args.cgroup_id = get_cgroup_id(path);
+	if (!bpf_args.cgroup_id)
 		return -EINVAL;
+	LIBBPF_OPTS_RESET(run_opts,
+		.ctx_in = &bpf_args,
+		.ctx_size_in = sizeof(bpf_args)
+	);
 
 	skel = afp_bpf__open();
 	if (!skel) {
@@ -197,6 +213,19 @@ int main(int argc, char **argv)
 	err = afp_bpf__load(skel);
 	if (err) {
 		fprintf(stderr, "Failed to load BPF skeleton: %d\n", err);
+		goto cleanup;
+	}
+
+	prog_init_fd = bpf_program__fd(skel->progs.prog_init);
+	if (prog_init_fd < 0) {
+		fprintf(stderr, "Failed to get prog_init fd\n");
+		err = -errno;
+		goto cleanup;
+	}
+	err = bpf_prog_test_run_opts(prog_init_fd, &run_opts);
+	if (err || run_opts.retval) {
+		fprintf(stderr, "BPF_PROG_RUN (init) failed: %d (retval=%d)\n",
+			err, run_opts.retval);
 		goto cleanup;
 	}
 
