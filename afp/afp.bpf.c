@@ -72,24 +72,25 @@ static void put_cgroup_memcg(struct cgroup_memcg *cm)
 static int async_free(void *map, int *key, void *value)
 {
 	struct cgroup_memcg cm;
-	int swappiness = 200;
 
 	if (get_cgroup_memcg_from_id(bpf_args.cgroup_id, &cm) != 0)
 		return 0;
 
-	if (!bpf_try_to_free_mem_cgroup_pages(cm.memcg,
+	if (bpf_try_to_free_mem_cgroup_pages(cm.memcg,
 		32,
 		GFP_KERNEL,
-		MEMCG_RECLAIM_MAY_SWAP | MEMCG_RECLAIM_PROACTIVE, &swappiness))
+		MEMCG_RECLAIM_MAY_SWAP | MEMCG_RECLAIM_PROACTIVE,
+		201) <= 0)
 		goto out;
 
 	if (bpf_mem_cgroup_usage(cm.memcg) >= bpf_args.limit_bytes) {
 		__u32 key2 = 0;
-		struct wq_elem *elem = bpf_map_lookup_elem(&wq_map, &key2);
+		struct wq_elem *elem;
+
+		elem = bpf_map_lookup_elem(&wq_map, &key2);
 		if (!elem)
 			goto out;
 		bpf_wq_start(&elem->work, 0);
-		bpf_printk("async_free\n");
 	}
 
 out:
