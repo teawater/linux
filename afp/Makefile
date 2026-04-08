@@ -27,7 +27,8 @@ $(APP).skel.h: $(BPF_OBJ)
 
 # 规则：编译 BPF C 代码
 $(BPF_OBJ): %.bpf.o: %.bpf.c $(VMLINUX_H)
-	clang -g -O2 -target bpf -c $(patsubst %.bpf.o,%.bpf.c,$@) -o $@
+	clang -g -O2 -target bpf \
+	-c $(patsubst %.bpf.o,%.bpf.c,$@) -o $@
 
 # 规则：编译用户态 C 代码
 $(OBJ): %.o: %.c $(APP).skel.h

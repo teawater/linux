@@ -4,6 +4,24 @@
 #include <bpf/bpf_tracing.h>
 #include <bpf/bpf_core_read.h>
 
+#define BIT(nr)			(1UL << (nr))
+
+#define ___GFP_IO		BIT(___GFP_IO_BIT)
+#define ___GFP_FS		BIT(___GFP_FS_BIT)
+#define ___GFP_DIRECT_RECLAIM	BIT(___GFP_DIRECT_RECLAIM_BIT)
+#define ___GFP_KSWAPD_RECLAIM	BIT(___GFP_KSWAPD_RECLAIM_BIT)
+
+#define __GFP_IO	((gfp_t)___GFP_IO)
+#define __GFP_FS	((gfp_t)___GFP_FS)
+#define __GFP_DIRECT_RECLAIM	((gfp_t)___GFP_DIRECT_RECLAIM) /* Caller can reclaim */
+#define __GFP_KSWAPD_RECLAIM	((gfp_t)___GFP_KSWAPD_RECLAIM) /* kswapd can wake */
+#define __GFP_RECLAIM ((gfp_t)(___GFP_DIRECT_RECLAIM|___GFP_KSWAPD_RECLAIM))
+
+#define GFP_KERNEL	(__GFP_RECLAIM | __GFP_IO | __GFP_FS)
+
+#define MEMCG_RECLAIM_MAY_SWAP (1 << 1)
+#define MEMCG_RECLAIM_PROACTIVE (1 << 2)
+
 #define ONE_MB_PAGE_COUNT 256
 
 struct bpf_args_s {
@@ -53,8 +71,29 @@ static void put_cgroup_memcg(struct cgroup_memcg *cm)
 
 static int async_free(void *map, int *key, void *value)
 {
-	bpf_printk("wq fired");
+	struct cgroup_memcg cm;
+	int swappiness = 200;
 
+	if (get_cgroup_memcg_from_id(bpf_args.cgroup_id, &cm) != 0)
+		return 0;
+
+	if (!bpf_try_to_free_mem_cgroup_pages(cm.memcg,
+		32,
+		GFP_KERNEL,
+		MEMCG_RECLAIM_MAY_SWAP | MEMCG_RECLAIM_PROACTIVE, &swappiness))
+		goto out;
+
+	if (bpf_mem_cgroup_usage(cm.memcg) >= bpf_args.limit_bytes) {
+		__u32 key2 = 0;
+		struct wq_elem *elem = bpf_map_lookup_elem(&wq_map, &key2);
+		if (!elem)
+			goto out;
+		bpf_wq_start(&elem->work, 0);
+		bpf_printk("async_free\n");
+	}
+
+out:
+	put_cgroup_memcg(&cm);
 	return 0;
 }
 
@@ -120,13 +159,12 @@ int BPF_PROG(tp_page_alloc, struct page *page, unsigned int order,
 	if (get_usage() < bpf_args.limit_bytes)
 		return 0;
 
-	bpf_printk("tp_page_alloc\n");
-
 	elem = bpf_map_lookup_elem(&wq_map, &key);
 	if (!elem)
 		return 0;
 
 	bpf_wq_start(&elem->work, 0);
+	bpf_printk("tp_page_alloc\n");
 
 	return 0;
 }
