@@ -3343,6 +3343,50 @@ __bpf_kfunc int bpf_wq_start(struct bpf_wq *wq, unsigned int flags)
 	}
 }
 
+/*
+ * bpf_wq_cancel - cancel a pending bpf_wq work item (best-effort)
+ * @wq: bpf_wq to cancel
+ * @flags: must be 0
+ *
+ * Tries to cancel @wq work. This is best-effort and only affects pending work.
+ * If the work has already started and is executing the callback, this does not
+ * wait for completion and does not stop the running callback.
+ *
+ * Returns:
+ *
+ *   * 0 on successful request handling:
+ *       - work was successfully canceled, or
+ *       - work was already running / not pending, or
+ *       - asynchronous cancel request was successfully queued
+ *   * -EINVAL when @flags is non-zero or the wq was not initialized
+ *   * -ENOENT when this kfunc is racing with wq deletion
+ *   * other negative errno from bpf_async_schedule_op() (e.g. -ENOMEM)
+ */
+__bpf_kfunc int bpf_wq_cancel(struct bpf_wq *wq, unsigned int flags)
+{
+	struct bpf_async_kern *async = (struct bpf_async_kern *)wq;
+	struct bpf_work *w;
+	int ret;
+
+	if (flags)
+		return -EINVAL;
+
+	w = READ_ONCE(async->work);
+	if (!w || !READ_ONCE(w->cb.prog))
+		return -EINVAL;
+
+	if (!refcount_inc_not_zero(&w->cb.refcnt))
+		return -ENOENT;
+
+	if (!defer_timer_wq_op()) {
+		cancel_work(&w->work);
+		bpf_async_refcount_put(&w->cb);
+		return 0;
+	}
+
+	return bpf_async_schedule_op(&w->cb, BPF_ASYNC_CANCEL, 0, 0);
+}
+
 __bpf_kfunc int bpf_wq_set_callback(struct bpf_wq *wq,
 				    int (callback_fn)(void *map, int *key, void *value),
 				    unsigned int flags,
@@ -4805,6 +4849,7 @@ BTF_ID_FLAGS(func, bpf_modify_return_test_tp)
 BTF_ID_FLAGS(func, bpf_wq_init)
 BTF_ID_FLAGS(func, bpf_wq_set_callback, KF_IMPLICIT_ARGS)
 BTF_ID_FLAGS(func, bpf_wq_start)
+BTF_ID_FLAGS(func, bpf_wq_cancel)
 BTF_ID_FLAGS(func, bpf_preempt_disable)
 BTF_ID_FLAGS(func, bpf_preempt_enable)
 BTF_ID_FLAGS(func, bpf_iter_bits_new, KF_ITER_NEW)
