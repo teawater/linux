@@ -29,6 +29,7 @@
 #include <linux/task_work.h>
 #include <linux/irq_work.h>
 #include <linux/buildid.h>
+#include <linux/kthread.h>
 
 #include "../../lib/kstrtox.h"
 
@@ -4669,6 +4670,321 @@ __bpf_kfunc int bpf_timer_cancel_async(struct bpf_timer *timer)
 	}
 }
 
+/*
+ * BPF thread workqueue (kthread_worker based) implementation
+ *
+ * Why bpf_thread_wq does NOT use the bpf_async infrastructure:
+ *
+ * bpf_timer and bpf_wq share a common cleanup path via bpf_async:
+ *
+ *   bpf_async_cancel_and_free()
+ *     -> bpf_async_schedule_op()
+ *       -> irq_work_queue()                // schedule from any context
+ *         -> bpf_async_process_op()        // runs in hardirq context
+ *           -> bpf_wq_work() / timer cb    // atomic, non-sleepable
+ *
+ * This works for timer and workqueue because their callbacks and
+ * cancellation (hrtimer_cancel / bpf_wq_cancel_and_free) complete
+ * synchronously and need not sleep.  The hardirq context is sufficient.
+ *
+ * bpf_thread_wq is different — its cleanup *must* sleep:
+ *
+ *   kthread_cancel_work_sync()    - waits for the work to finish, can
+ *                                    schedule out if the work is running.
+ *   kthread_destroy_worker()      - stops the kthread, internally
+ *                                    synchronizes with kthread exit.
+ *   cgroup_put() (final put)      - may acquire cgroup_mutex and other
+ *                                    sleeping locks during offline.
+ *
+ * None of these can be called from hardirq context (irq_work).  Doing
+ * so would trigger might_sleep() warnings or deadlock.
+ *
+ * Therefore bpf_thread_wq implements its own RCU-based cleanup:
+ *
+ *   bpf_thread_wq_cancel_and_free()        // sleepable (called from
+ *                                          // map free / elem delete)
+ *     -> xchg(ctx, NULL)                   // detach atomically
+ *     -> kthread_cancel_work_sync()        // ok to sleep
+ *     -> bpf_prog_put()
+ *     -> refcount_dec_and_test()
+ *       -> call_rcu_tasks_trace()          // defer to RCU callback
+ *         -> kthread_destroy_worker()      // ok to sleep (rcu cb is
+ *         -> cgroup_put()                  //   sleepable context)
+ *         -> kfree(ctx)
+ *
+ * The same design choice was made for bpf_task_work, which also avoids
+ * bpf_async because task_work cancellation synchronizes with the task
+ * and may sleep.
+ */
+
+struct bpf_thread_wq_ctx {
+	struct kthread_worker *worker;
+	struct kthread_work work;
+	struct bpf_prog *prog;
+	bpf_callback_t callback_fn;
+	struct bpf_map *map;
+	void *value;
+	struct cgroup *cgrp;
+	refcount_t refcnt;
+	struct rcu_head rcu;
+};
+
+/* Kernel-internal representation that fits in struct bpf_thread_wq */
+struct bpf_thread_wq_kern {
+	struct bpf_thread_wq_ctx *ctx;
+} __aligned(8);
+
+static void bpf_thread_wq_ctx_free_rcu(struct rcu_head *rcu)
+{
+	struct bpf_thread_wq_ctx *ctx = container_of(rcu, struct bpf_thread_wq_ctx, rcu);
+
+	if (ctx->prog)
+		bpf_prog_put(ctx->prog);
+	if (ctx->cgrp)
+		cgroup_put(ctx->cgrp);
+	if (ctx->worker)
+		kthread_destroy_worker(ctx->worker);
+	kfree(ctx);
+}
+
+static void bpf_thread_wq_ctx_put(struct bpf_thread_wq_ctx *ctx)
+{
+	if (!refcount_dec_and_test(&ctx->refcnt))
+		return;
+	call_rcu_tasks_trace(&ctx->rcu, bpf_thread_wq_ctx_free_rcu);
+}
+
+static void bpf_thread_wq_work_fn(struct kthread_work *work)
+{
+	struct bpf_thread_wq_ctx *ctx = container_of(work, struct bpf_thread_wq_ctx, work);
+	bpf_callback_t callback_fn;
+	void *value = ctx->value;
+	struct bpf_map *map = ctx->map;
+	void *key;
+	u32 idx;
+
+	BTF_TYPE_EMIT(struct bpf_thread_wq);
+
+	callback_fn = READ_ONCE(ctx->callback_fn);
+	if (!callback_fn)
+		goto out;
+	key = map_key_from_value(map, value, &idx);
+
+	rcu_read_lock_trace();
+	migrate_disable();
+
+	callback_fn((u64)(long)map, (u64)(long)key, (u64)(long)value, 0, 0);
+
+	migrate_enable();
+	rcu_read_unlock_trace();
+
+out:
+	bpf_thread_wq_ctx_put(ctx);
+}
+
+__bpf_kfunc int bpf_thread_wq_init(struct bpf_thread_wq *twq, void *p__map,
+				   u64 cgroup_id, unsigned int flags)
+{
+	struct bpf_thread_wq_kern *twk = (struct bpf_thread_wq_kern *)twq;
+	struct bpf_map *map = p__map;
+	struct bpf_thread_wq_ctx *ctx, *old_ctx;
+	struct kthread_worker *worker;
+	struct cgroup *cgrp = NULL;
+	int err;
+
+	BUILD_BUG_ON(sizeof(struct bpf_thread_wq_kern)
+			> sizeof(struct bpf_thread_wq));
+	BUILD_BUG_ON(__alignof__(struct bpf_thread_wq_kern)
+			!= __alignof__(struct bpf_thread_wq));
+
+	if (flags)
+		return -EINVAL;
+
+	old_ctx = READ_ONCE(twk->ctx);
+	if (old_ctx)
+		return -EBUSY;
+
+	worker = kthread_run_worker(0, "bpf_twq/%d", map->id);
+	if (IS_ERR(worker))
+		return PTR_ERR(worker);
+
+	if (cgroup_id) {
+#ifdef CONFIG_CGROUPS
+		cgrp = cgroup_get_from_id(cgroup_id);
+		if (IS_ERR(cgrp)) {
+			err = PTR_ERR(cgrp);
+			goto destroy_worker;
+		}
+
+		/*
+		 * kthread_run_worker() wakes the kthread, but it may not have
+		 * executed cgroup_kthread_ready() yet, which clears
+		 * no_cgroup_migration.
+		 * Give the scheduler a chance to run the kthread so that the
+		 * check below has a higher chance of seeing
+		 * no_cgroup_migration == 0.
+		 * This is a best-effort optimization; if the kthread still
+		 * hasn't run, we return -EAGAIN and the BPF program can retry.
+		 */
+		cond_resched();
+		if (worker->task->no_cgroup_migration) {
+			err = -EAGAIN;
+			goto cgroup_put;
+		}
+
+		/* To make sure caller doesn't acquire cgroup_lock. */
+		if (cgroup_is_locked()) {
+			err = -EBUSY;
+			goto cgroup_put;
+		}
+		err = cgroup_kthread_attach(cgrp, worker->task);
+		if (err)
+			goto cgroup_put;
+#else
+		err = -EOPNOTSUPP;
+		goto destroy_worker;
+#endif
+	}
+
+	ctx = bpf_map_kmalloc_nolock(map, sizeof(*ctx), GFP_KERNEL,
+				     map->numa_node);
+	if (!ctx) {
+		err = -ENOMEM;
+		goto cgroup_put;
+	}
+
+	memset(ctx, 0, sizeof(*ctx));
+	ctx->worker = worker;
+	ctx->cgrp = cgrp;
+	ctx->map = map;
+	ctx->value = (void *)twq - map->record->thread_wq_off;
+	refcount_set(&ctx->refcnt, 1);
+
+	kthread_init_work(&ctx->work, bpf_thread_wq_work_fn);
+
+	old_ctx = cmpxchg(&twk->ctx, NULL, ctx);
+	if (old_ctx) {
+		err = -EBUSY;
+		goto kfree_ctx;
+	}
+
+	/*
+	 * Paired with the map destruction path.  Ensures that ctx is globally
+	 * visible before we check map->usercnt.
+	 * If usercnt has dropped to zero, the destruction path will either see
+	 * the ctx (and cancel it) or we see usercnt == 0 here and cancel
+	 * ourselves.
+	 * Without this barrier, a CPU could reorder the load of usercnt before
+	 * the cmpxchg store becomes visible, breaking the mutual exclusion
+	 * guarantee.
+	 */
+	smp_mb();
+
+	if (!atomic64_read(&map->usercnt)) {
+		bpf_thread_wq_cancel_and_free(twq);
+		return -EPERM;
+	}
+
+	return 0;
+
+kfree_ctx:
+	kfree(ctx);
+cgroup_put:
+	if (cgrp)
+		cgroup_put(cgrp);
+destroy_worker:
+	kthread_destroy_worker(worker);
+	return err;
+}
+
+__bpf_kfunc int bpf_thread_wq_set_callback(struct bpf_thread_wq *twq,
+					   int (callback_fn)(void *map,
+							     int *key,
+							     void *value),
+					   unsigned int flags,
+					   struct bpf_prog_aux *aux)
+{
+	struct bpf_thread_wq_kern *twk = (struct bpf_thread_wq_kern *)twq;
+	struct bpf_thread_wq_ctx *ctx;
+	struct bpf_prog *prev, *prog;
+
+	if (flags)
+		return -EINVAL;
+
+	ctx = READ_ONCE(twk->ctx);
+	if (!ctx)
+		return -EINVAL;
+
+	prog = bpf_prog_inc_not_zero(aux->prog);
+	if (IS_ERR(prog))
+		return PTR_ERR(prog);
+
+	prev = xchg(&ctx->prog, prog);
+	if (prev)
+		bpf_prog_put(prev);
+	WRITE_ONCE(ctx->callback_fn, (void *)callback_fn);
+
+	return 0;
+}
+
+__bpf_kfunc int
+bpf_thread_wq_start(struct bpf_thread_wq *twq, unsigned int flags)
+{
+	struct bpf_thread_wq_kern *twk = (struct bpf_thread_wq_kern *)twq;
+	struct bpf_thread_wq_ctx *ctx;
+	int err;
+
+	if (flags)
+		return -EINVAL;
+
+	rcu_read_lock_trace();
+
+	err = 0;
+
+	ctx = READ_ONCE(twk->ctx);
+	if (!ctx || !READ_ONCE(ctx->callback_fn)) {
+		err = -EINVAL;
+		goto unlock;
+	}
+
+	if (!refcount_inc_not_zero(&ctx->refcnt))
+		err = -ENOENT;
+
+unlock:
+	rcu_read_unlock_trace();
+	if (err)
+		return err;
+
+	if (!kthread_queue_work(ctx->worker, &ctx->work)) {
+		bpf_thread_wq_ctx_put(ctx);
+		return -EBUSY;
+	}
+
+	return 0;
+}
+
+void bpf_thread_wq_cancel_and_free(void *val)
+{
+	struct bpf_thread_wq_kern *twk = val;
+	struct bpf_thread_wq_ctx *ctx;
+
+	ctx = xchg(&twk->ctx, NULL);
+	if (!ctx)
+		return;
+
+	might_sleep();
+
+	WRITE_ONCE(ctx->callback_fn, NULL);
+	kthread_cancel_work_sync(&ctx->work);
+
+	if (ctx->prog) {
+		bpf_prog_put(ctx->prog);
+		ctx->prog = NULL;
+	}
+
+	bpf_thread_wq_ctx_put(ctx);
+}
+
 __bpf_kfunc_end_defs();
 
 static void bpf_task_work_cancel_scheduled(struct irq_work *irq_work)
@@ -4810,6 +5126,9 @@ BTF_ID_FLAGS(func, bpf_modify_return_test_tp)
 BTF_ID_FLAGS(func, bpf_wq_init)
 BTF_ID_FLAGS(func, bpf_wq_set_callback, KF_IMPLICIT_ARGS)
 BTF_ID_FLAGS(func, bpf_wq_start)
+BTF_ID_FLAGS(func, bpf_thread_wq_init, KF_SLEEPABLE)
+BTF_ID_FLAGS(func, bpf_thread_wq_set_callback, KF_IMPLICIT_ARGS)
+BTF_ID_FLAGS(func, bpf_thread_wq_start)
 BTF_ID_FLAGS(func, bpf_preempt_disable)
 BTF_ID_FLAGS(func, bpf_preempt_enable)
 BTF_ID_FLAGS(func, bpf_iter_bits_new, KF_ITER_NEW)
@@ -4930,4 +5249,6 @@ void bpf_map_free_internal_structs(struct bpf_map *map, void *val)
 		bpf_obj_free_workqueue(map->record, val);
 	if (btf_record_has_field(map->record, BPF_TASK_WORK))
 		bpf_obj_free_task_work(map->record, val);
+	if (btf_record_has_field(map->record, BPF_THREAD_WQ))
+		bpf_obj_free_thread_wq(map->record, val);
 }

@@ -451,6 +451,11 @@ static inline void cgroup_put(struct cgroup *cgrp)
 	css_put(&cgrp->self);
 }
 
+static inline int cgroup_is_locked(void)
+{
+	return mutex_is_locked(&cgroup_mutex);
+}
+
 static inline void cgroup_lock(void)
 {
 	mutex_lock(&cgroup_mutex);
@@ -901,5 +906,7 @@ static inline void cgroup_bpf_put(struct cgroup *cgrp) {}
 struct cgroup *task_get_cgroup1(struct task_struct *tsk, int hierarchy_id);
 
 struct cgroup_of_peak *of_peak(struct kernfs_open_file *of);
+
+int cgroup_kthread_attach(struct cgroup *cgrp, struct task_struct *task);
 
 #endif /* _LINUX_CGROUP_H */
