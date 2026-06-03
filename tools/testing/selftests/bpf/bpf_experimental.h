@@ -433,6 +433,19 @@ extern void bpf_iter_css_destroy(struct bpf_iter_css *it) __weak __ksym;
 extern int bpf_wq_init(struct bpf_wq *wq, void *p__map, unsigned int flags) __weak __ksym;
 extern int bpf_wq_start(struct bpf_wq *wq, unsigned int flags) __weak __ksym;
 
+struct bpf_thread_wq;
+extern int bpf_thread_wq_init(struct bpf_thread_wq *twq, void *p__map,
+			      __u64 cgroup_id,
+			      unsigned int flags) __weak __ksym;
+extern int bpf_thread_wq_set_callback(struct bpf_thread_wq *twq,
+				      int (callback_fn)(void *map,
+							int *key,
+							void *value),
+				      unsigned int flags,
+				      struct bpf_prog_aux *aux) __weak __ksym;
+extern int bpf_thread_wq_start(struct bpf_thread_wq *twq,
+			       unsigned int flags) __weak __ksym;
+
 struct bpf_iter_kmem_cache;
 extern int bpf_iter_kmem_cache_new(struct bpf_iter_kmem_cache *it) __weak __ksym;
 extern struct kmem_cache *bpf_iter_kmem_cache_next(struct bpf_iter_kmem_cache *it) __weak __ksym;
