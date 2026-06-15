@@ -4719,6 +4719,8 @@ __bpf_kfunc int bpf_timer_cancel_async(struct bpf_timer *timer)
 
 struct bpf_thread_wq_ctx {
 	struct kthread_worker *worker;
+	wait_queue_head_t init_waitquque;
+	struct kthread_work init_work;
 	struct kthread_work work;
 	struct bpf_prog *prog;
 	bpf_callback_t callback_fn;
@@ -4752,6 +4754,13 @@ static void bpf_thread_wq_ctx_put(struct bpf_thread_wq_ctx *ctx)
 	if (!refcount_dec_and_test(&ctx->refcnt))
 		return;
 	call_rcu_tasks_trace(&ctx->rcu, bpf_thread_wq_ctx_free_rcu);
+}
+
+static void bpf_thread_init_fn(struct kthread_work *work)
+{
+	struct bpf_thread_wq_ctx *ctx = container_of(work, struct bpf_thread_wq_ctx, work);
+
+
 }
 
 static void bpf_thread_wq_work_fn(struct kthread_work *work)
@@ -4808,12 +4817,28 @@ __bpf_kfunc int bpf_thread_wq_init(struct bpf_thread_wq *twq, void *p__map,
 	if (IS_ERR(worker))
 		return PTR_ERR(worker);
 
+	/* Setup ctx. */
+	ctx = bpf_map_kmalloc_nolock(map, sizeof(*ctx), GFP_KERNEL,
+				     map->numa_node);
+	if (!ctx) {
+		err = -ENOMEM;
+		goto destroy_worker;
+	}
+	memset(ctx, 0, sizeof(*ctx));
+	ctx->worker = worker;
+	ctx->cgrp = cgrp;
+	ctx->map = map;
+	ctx->value = (void *)twq - map->record->thread_wq_off;
+	refcount_set(&ctx->refcnt, 1);
+	kthread_init_work(&ctx->init_work, bpf_thread_init_fn);
+	kthread_init_work(&ctx->work, bpf_thread_wq_work_fn);
+
 	if (cgroup_id) {
 #ifdef CONFIG_CGROUPS
 		cgrp = cgroup_get_from_id(cgroup_id);
 		if (IS_ERR(cgrp)) {
 			err = PTR_ERR(cgrp);
-			goto destroy_worker;
+			goto kfree_ctx;
 		}
 
 		/*
@@ -4827,6 +4852,9 @@ __bpf_kfunc int bpf_thread_wq_init(struct bpf_thread_wq *twq, void *p__map,
 		 * hasn't run, we return -EAGAIN and the BPF program can retry.
 		 */
 		cond_resched();
+		
+		
+
 		if (worker->task->no_cgroup_migration) {
 			err = -EAGAIN;
 			goto cgroup_put;
@@ -4846,26 +4874,10 @@ __bpf_kfunc int bpf_thread_wq_init(struct bpf_thread_wq *twq, void *p__map,
 #endif
 	}
 
-	ctx = bpf_map_kmalloc_nolock(map, sizeof(*ctx), GFP_KERNEL,
-				     map->numa_node);
-	if (!ctx) {
-		err = -ENOMEM;
-		goto cgroup_put;
-	}
-
-	memset(ctx, 0, sizeof(*ctx));
-	ctx->worker = worker;
-	ctx->cgrp = cgrp;
-	ctx->map = map;
-	ctx->value = (void *)twq - map->record->thread_wq_off;
-	refcount_set(&ctx->refcnt, 1);
-
-	kthread_init_work(&ctx->work, bpf_thread_wq_work_fn);
-
 	old_ctx = cmpxchg(&twk->ctx, NULL, ctx);
 	if (old_ctx) {
 		err = -EBUSY;
-		goto kfree_ctx;
+		goto cgroup_put;
 	}
 
 	/*
@@ -4887,11 +4899,11 @@ __bpf_kfunc int bpf_thread_wq_init(struct bpf_thread_wq *twq, void *p__map,
 
 	return 0;
 
-kfree_ctx:
-	kfree(ctx);
 cgroup_put:
 	if (cgrp)
 		cgroup_put(cgrp);
+kfree_ctx:
+	kfree(ctx);
 destroy_worker:
 	kthread_destroy_worker(worker);
 	return err;
