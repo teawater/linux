@@ -78,7 +78,7 @@ void serial_test_thread_wq_cgroup(void)
 		goto cleanup;
 
 	/* --- Run bpf_thread_wq (throttled) --- */
-	memset(&topts, 0, sizeof(topts));
+	LIBBPF_OPTS_RESET(topts);
 	prog_fd = bpf_program__fd(skel->progs.start_thread_wq);
 	err = bpf_prog_test_run_opts(prog_fd, &topts);
 	ASSERT_OK(err, "run start_thread_wq");
