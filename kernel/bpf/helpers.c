@@ -4719,8 +4719,6 @@ __bpf_kfunc int bpf_timer_cancel_async(struct bpf_timer *timer)
 
 struct bpf_thread_wq_ctx {
 	struct kthread_worker *worker;
-	wait_queue_head_t init_waitquque;
-	struct kthread_work init_work;
 	struct kthread_work work;
 	struct bpf_prog *prog;
 	bpf_callback_t callback_fn;
@@ -4830,7 +4828,6 @@ __bpf_kfunc int bpf_thread_wq_init(struct bpf_thread_wq *twq, void *p__map,
 	ctx->map = map;
 	ctx->value = (void *)twq - map->record->thread_wq_off;
 	refcount_set(&ctx->refcnt, 1);
-	kthread_init_work(&ctx->init_work, bpf_thread_init_fn);
 	kthread_init_work(&ctx->work, bpf_thread_wq_work_fn);
 
 	if (cgroup_id) {
@@ -4845,15 +4842,15 @@ __bpf_kfunc int bpf_thread_wq_init(struct bpf_thread_wq *twq, void *p__map,
 		 * kthread_run_worker() wakes the kthread, but it may not have
 		 * executed cgroup_kthread_ready() yet, which clears
 		 * no_cgroup_migration.
-		 * Give the scheduler a chance to run the kthread so that the
-		 * check below has a higher chance of seeing
-		 * no_cgroup_migration == 0.
-		 * This is a best-effort optimization; if the kthread still
-		 * hasn't run, we return -EAGAIN and the BPF program can retry.
+		 * Do a queue work and flush to wait the kthread run.
 		 */
-		cond_resched();
-		
-		
+		if (!kthread_queue_work(ctx->worker, &ctx->work)) {
+			err = -EBUSY;
+			goto cgroup_put;
+		}
+		kthread_flush_work(&ctx->work);
+
+		//cond_resched();
 
 		if (worker->task->no_cgroup_migration) {
 			err = -EAGAIN;
