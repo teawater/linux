@@ -5019,10 +5019,21 @@ void bpf_thread_wq_cancel_and_free(void *val)
 	 * work item from the work_list without executing it.  Each successful
 	 * bpf_thread_wq_start() call increments ctx->refcnt and relies on the
 	 * subsequent bpf_thread_wq_work_fn() execution to release that
-	 * reference via bpf_thread_wq_ctx_put().  If the work was pending
-	 * (e.g. self-rescheduled from within the callback) and got cancelled
-	 * here, work_fn will never run for that queued instance, so we must
-	 * drop the reference ourselves to avoid a permanent refcount leak.
+	 * reference via bpf_thread_wq_ctx_put().  If the work was pending and
+	 * got cancelled here, work_fn will never run for that queued instance,
+	 * so we must drop the reference ourselves to avoid a permanent refcount
+	 * leak.
+	 *
+	 * This covers two scenarios uniformly:
+	 *  1. The work is purely pending (not currently executing) — e.g. a
+	 *     normal bpf_thread_wq_start() call queued it but the worker
+	 *     thread hasn't picked it up yet.
+	 *  2. The work is currently in-flight AND was self-rescheduled from
+	 *     within the callback — kthread_cancel_work_sync() dequeues the
+	 *     re-queued pending node and then waits for the in-flight
+	 *     execution to complete.
+	 * In both cases the return value is true, indicating one orphaned
+	 * reference that needs to be released here.
 	 */
 	if (kthread_cancel_work_sync(&ctx->work))
 		bpf_thread_wq_ctx_put(ctx);
