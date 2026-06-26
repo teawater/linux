@@ -5013,14 +5013,27 @@ void bpf_thread_wq_cancel_and_free(void *val)
 	 * in-progress execution to finish.
 	 */
 	WRITE_ONCE(ctx->callback_fn, NULL);
-	kthread_cancel_work_sync(&ctx->work);
 
 	/*
-	 * Drop our reference.  If the work was still in flight the refcount
-	 * won't hit zero here — it will reach zero when the work path calls
-	 * bpf_thread_wq_ctx_put().  Either way, final cleanup (worker
-	 * destruction, prog put, cgroup put, kfree) happens exclusively in
-	 * the RCU callback to keep the teardown path single-threaded.
+	 * kthread_cancel_work_sync() returns true when it dequeues a pending
+	 * work item from the work_list without executing it.  Each successful
+	 * bpf_thread_wq_start() call increments ctx->refcnt and relies on the
+	 * subsequent bpf_thread_wq_work_fn() execution to release that
+	 * reference via bpf_thread_wq_ctx_put().  If the work was pending
+	 * (e.g. self-rescheduled from within the callback) and got cancelled
+	 * here, work_fn will never run for that queued instance, so we must
+	 * drop the reference ourselves to avoid a permanent refcount leak.
+	 */
+	if (kthread_cancel_work_sync(&ctx->work))
+		bpf_thread_wq_ctx_put(ctx);
+
+	/*
+	 * Drop our own reference.  If the work was still in-flight above,
+	 * the refcount won't hit zero here — it will reach zero when the
+	 * work path calls bpf_thread_wq_ctx_put() upon completion.  Either
+	 * way, final cleanup (worker destruction, prog put, cgroup put,
+	 * kfree) happens exclusively in the RCU callback to keep the
+	 * teardown path single-threaded.
 	 */
 	bpf_thread_wq_ctx_put(ctx);
 }
