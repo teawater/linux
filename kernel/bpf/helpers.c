@@ -4929,7 +4929,7 @@ __bpf_kfunc int bpf_thread_wq_set_callback(struct bpf_thread_wq *twq,
 {
 	struct bpf_thread_wq_kern *twk = (struct bpf_thread_wq_kern *)twq;
 	struct bpf_thread_wq_ctx *ctx;
-	struct bpf_prog *prev, *prog;
+	struct bpf_prog *prog;
 
 	if (flags)
 		return -EINVAL;
@@ -4942,9 +4942,18 @@ __bpf_kfunc int bpf_thread_wq_set_callback(struct bpf_thread_wq *twq,
 	if (IS_ERR(prog))
 		return PTR_ERR(prog);
 
-	prev = xchg(&ctx->prog, prog);
-	if (prev)
-		bpf_prog_put(prev);
+	/* Allow set_callback only once to prevent UAF: a concurrent
+	 * set_callback could bpf_prog_put() the prog while the worker
+	 * kthread is still executing its callback.
+	 */
+	if (cmpxchg(&ctx->prog, NULL, prog) != NULL) {
+		bpf_prog_put(prog);
+		return -EBUSY;
+	}
+	/* Safe to set callback_fn after prog: bpf_thread_wq_start() and
+	 * bpf_thread_wq_work_fn() both check callback_fn with READ_ONCE()
+	 * and bail out if it is still NULL.
+	 */
 	WRITE_ONCE(ctx->callback_fn, (void *)callback_fn);
 
 	return 0;
