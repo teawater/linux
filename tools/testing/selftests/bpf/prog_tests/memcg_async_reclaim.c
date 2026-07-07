@@ -36,34 +36,33 @@ struct bpf_args_s {
 #define EVENT_DELTA_THRESHOLD 1
 
 static int
-setup_max_cgroup(const char *cg_path, u64 cg_max, u64 *cgroup_id,
-		 int *cgroup_fd)
+setup_max_cgroup(const char *cg_path, u64 cg_max, u64 *cgroup_id)
 {
 	int ret;
 	char limit_buf[20];
 
-	*cgroup_fd = create_and_get_cgroup(cg_path);
-	if (!ASSERT_GE(*cgroup_fd, 0, "create_and_get_cgroup"))
-		return -1;
+	ret = create_and_get_cgroup(cg_path);
+	if (!ASSERT_GE(ret, 0, "create_and_get_cgroup"))
+		goto out;
+	close(ret);
 
 	*cgroup_id = get_cgroup_id(cg_path);
-	if (!ASSERT_GT(*cgroup_id, 0, "get_cgroup_id"))
-		goto cleanup;
+	if (!ASSERT_GT(*cgroup_id, 0, "get_cgroup_id")) {
+		ret = -EINVAL;
+		goto out;
+	}
 
 	snprintf(limit_buf, sizeof(limit_buf), "%lu", cg_max);
 	ret = write_cgroup_file(cg_path, "memory.max", limit_buf);
 	if (!ASSERT_OK(ret, "write_cgroup_file memory.max"))
-		goto cleanup;
+		goto out;
 
 	ret = write_cgroup_file(cg_path, "memory.swap.max", "0");
 	if (!ASSERT_OK(ret, "write_cgroup_file memory.swap.max"))
-		goto cleanup;
+		goto out;
 
-	return 0;
-
-cleanup:
-	close(*cgroup_fd);
-	return -1;
+out:
+	return ret;
 }
 
 static int
@@ -277,15 +276,14 @@ cleanup:
 void test_memcg_async_reclaim(void)
 {
 	u64 cgroup_id, max_change1 = 0, max_change2 = 0, max_change3 = 0;
-	int cgroup_fd1 = -1, cgroup_fd2 = -1, cgroup_fd3 = -1;
 	struct memcg_async_reclaim *skel = NULL;
 
 	if (!ASSERT_OK(setup_cgroup_environment(), "setup_cgroup_environment"))
 		return;
 
 	/* Baseline: no BPF async reclaim attached. */
-	if (!ASSERT_OK(setup_max_cgroup(CG_DIR1, CG_LIMIT, &cgroup_id,
-					&cgroup_fd1), "setup_max_cgroup"))
+	if (!ASSERT_OK(setup_max_cgroup(CG_DIR1, CG_LIMIT, &cgroup_id),
+		       "setup_max_cgroup"))
 		goto cleanup_cgroup;
 	if (run_workload(CG_DIR1, &max_change1))
 		goto cleanup_cgroup;
@@ -297,8 +295,8 @@ void test_memcg_async_reclaim(void)
 		goto cleanup_cgroup;
 
 	/* bpf_wq based async reclaim. */
-	if (!ASSERT_OK(setup_max_cgroup(CG_DIR2, CG_LIMIT, &cgroup_id,
-					&cgroup_fd2), "setup_max_cgroup"))
+	if (!ASSERT_OK(setup_max_cgroup(CG_DIR2, CG_LIMIT, &cgroup_id),
+		       "setup_max_cgroup"))
 		goto cleanup_skel;
 	if (setup_bpf(skel, cgroup_id, false))
 		goto cleanup_skel;
@@ -306,13 +304,15 @@ void test_memcg_async_reclaim(void)
 		goto cleanup_skel;
 
 	/* bpf_thread_wq based async reclaim. */
-	if (!ASSERT_OK(setup_max_cgroup(CG_DIR3, CG_LIMIT, &cgroup_id,
-					&cgroup_fd3), "setup_max_cgroup"))
+	if (!ASSERT_OK(setup_max_cgroup(CG_DIR3, CG_LIMIT, &cgroup_id),
+		       "setup_max_cgroup"))
 		goto cleanup_skel;
 	if (setup_bpf(skel, cgroup_id, true))
 		goto cleanup_skel;
 	if (run_workload(CG_DIR3, &max_change3))
 		goto cleanup_skel;
+
+	printf("%lu %lu %lu\n", max_change1, max_change2, max_change3);
 
 	ASSERT_LT(max_change2, max_change1,
 		 "bpf_wq async reclaim did not reduce memcg max events");
@@ -322,12 +322,6 @@ void test_memcg_async_reclaim(void)
 cleanup_skel:
 	if (skel)
 		memcg_async_reclaim__destroy(skel);
-	if (cgroup_fd3 >= 0)
-		close(cgroup_fd3);
-	if (cgroup_fd2 >= 0)
-		close(cgroup_fd2);
 cleanup_cgroup:
-	if (cgroup_fd1 >= 0)
-		close(cgroup_fd1);
-	cleanup_cgroup_environment();
+	//cleanup_cgroup_environment();
 }

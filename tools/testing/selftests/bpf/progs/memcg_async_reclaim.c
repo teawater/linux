@@ -21,16 +21,8 @@
 #define GFP_KERNEL	(__GFP_RECLAIM | __GFP_IO | __GFP_FS)
 #define CLOCK_MONOTONIC_ID	1
 #define RECLAIM_PAGES		32
-#define RECLAIM_MAX_ITER	16
+#define RECLAIM_MAX_ITER	32
 
-/*
- * cgroup_id:             target cgroup to monitor and reclaim from.
- * event_delta_threshold: number of new memory.events "max" events
- *                        (MEMCG_MAX) accumulated within one check_ns
- *                        period above which the cgroup is considered
- *                        under enough pressure to proactively reclaim.
- * check_ns:              sampling period of the pressure timer.
- */
 struct bpf_args_s {
 	u64 cgroup_id;
 	u64 event_delta_threshold;
@@ -63,20 +55,37 @@ static void put_cgroup_memcg(struct cgroup_memcg *cm)
 	bpf_cgroup_release(cm->cgrp);
 }
 
-static int get_cgroup_max_event(u64 cgroup_id, u64 *val)
+static int get_cgroup_event(u64 cgroup_id, u64 *val)
 {
 	struct cgroup_memcg cm;
 
 	if (get_cgroup_memcg_from_id(cgroup_id, &cm))
 		return -1;
-
-	*val = bpf_mem_cgroup_memory_events(cm.memcg, MEMCG_MAX);
+	bpf_mem_cgroup_flush_stats(cm.memcg);
+	*val = bpf_mem_cgroup_page_state(cm.memcg, PGSTEAL_DIRECT);
 	put_cgroup_memcg(&cm);
+
+	if (*val)
+		bpf_printk("%lu\n", *val);
 
 	return 0;
 }
 
-static int reclaim_cgroup(u64 cgroup_id, u64 reclaim_enabled)
+static bool
+should_reclaim_cgroup(u64 cgroup_id, u64 *prev_event, u64 event_delta_threshold)
+{
+	u64 cur, delta;
+
+	if (get_cgroup_event(cgroup_id, &cur))
+		return false;
+
+	delta = cur - *prev_event;
+	*prev_event = cur;
+
+	return delta >= event_delta_threshold;
+}
+
+static int reclaim_cgroup(u64 cgroup_id)
 {
 	struct cgroup_memcg cm;
 	int i;
@@ -84,25 +93,26 @@ static int reclaim_cgroup(u64 cgroup_id, u64 reclaim_enabled)
 	if (get_cgroup_memcg_from_id(cgroup_id, &cm))
 		return 0;
 
+	bpf_mem_cgroup_flush_stats(cm.memcg);
+
 	for (i = 0; i < RECLAIM_MAX_ITER; i++) {
-		if (!reclaim_enabled)
-			break;
 		if (!bpf_try_to_free_mem_cgroup_pages(cm.memcg, RECLAIM_PAGES,
 						      GFP_KERNEL, 0, -1))
 			break;
 	}
+
 	put_cgroup_memcg(&cm);
 
 	return 0;
 }
 
 /* bpf_wq based async reclaim */
-
 struct wq_elem {
 	struct bpf_timer timer;
 	struct bpf_wq work;
-	u64 prev_max_event;
-	u64 reclaim_enabled;
+	u64 prev_event;
+	u64 event_delta_threshold;
+	u64 check_ns;
 };
 
 struct {
@@ -112,34 +122,26 @@ struct {
 	__type(value, struct wq_elem);
 } wq_map SEC(".maps");
 
-static struct bpf_args_s wq_bpf_args;
+static u64 wq_cgroup_id;
 
 static int async_free(void *map, int *key, void *value)
 {
 	struct wq_elem *elem = value;
 
-	reclaim_cgroup(wq_bpf_args.cgroup_id, elem->reclaim_enabled);
+	if (should_reclaim_cgroup(wq_cgroup_id, &elem->prev_event,
+				  elem->event_delta_threshold)) {
+		reclaim_cgroup(wq_cgroup_id);
+		bpf_wq_start(&elem->work, 0);
+	}
 
 	return 0;
 }
 
 static int wq_timer_cb(void *map, int *key, struct wq_elem *elem)
 {
-	u64 cur, delta;
+	bpf_wq_start(&elem->work, 0);
 
-	if (!get_cgroup_max_event(wq_bpf_args.cgroup_id, &cur)) {
-		delta = cur - elem->prev_max_event;
-		elem->prev_max_event = cur;
-
-		if (delta >= wq_bpf_args.event_delta_threshold) {
-			elem->reclaim_enabled = 1;
-			bpf_wq_start(&elem->work, 0);
-		} else {
-			elem->reclaim_enabled = 0;
-		}
-	}
-
-	bpf_timer_start(&elem->timer, wq_bpf_args.check_ns, 0);
+	bpf_timer_start(&elem->timer, elem->check_ns, 0);
 	return 0;
 }
 
@@ -173,18 +175,17 @@ int wq_prog_init(struct bpf_args_s *ctx)
 	if (ret)
 		return ret;
 
-	elem->prev_max_event = 0;
-	elem->reclaim_enabled = 0;
+	elem->prev_event = 0;
+	elem->event_delta_threshold = ctx->event_delta_threshold;
+	elem->check_ns = ctx->check_ns;
 
-	wq_bpf_args.cgroup_id = ctx->cgroup_id;
-	wq_bpf_args.event_delta_threshold = ctx->event_delta_threshold;
-	wq_bpf_args.check_ns = ctx->check_ns;
+	wq_cgroup_id = ctx->cgroup_id;
 
-	return bpf_timer_start(&elem->timer, wq_bpf_args.check_ns, 0);
+	return bpf_timer_start(&elem->timer, elem->check_ns, 0);
 }
 
 /* bpf_thread_wq based async reclaim */
-
+#if 0
 struct thread_wq_elem {
 	struct bpf_timer timer;
 	struct bpf_thread_wq work;
@@ -268,6 +269,12 @@ int thread_wq_prog_init(struct bpf_args_s *ctx)
 	thread_wq_bpf_args.check_ns = ctx->check_ns;
 
 	return bpf_timer_start(&elem->timer, thread_wq_bpf_args.check_ns, 0);
+}
+#endif
+SEC("syscall")
+int thread_wq_prog_init(struct bpf_args_s *ctx)
+{
+	return 0;
 }
 
 char LICENSE[] SEC("license") = "GPL";
