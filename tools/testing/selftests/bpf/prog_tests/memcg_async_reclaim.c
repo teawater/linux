@@ -312,8 +312,6 @@ void test_memcg_async_reclaim(void)
 	if (run_workload(CG_DIR3, &max_change3))
 		goto cleanup_skel;
 
-	printf("%lu %lu %lu\n", max_change1, max_change2, max_change3);
-
 	ASSERT_LT(max_change2, max_change1,
 		 "bpf_wq async reclaim did not reduce memcg max events");
 	ASSERT_LT(max_change3, max_change1,
@@ -323,6 +321,10 @@ cleanup_skel:
 	if (skel)
 		memcg_async_reclaim__destroy(skel);
 cleanup_cgroup:
+	/*
+	 * Wait for bpf_thread_wq to release the reference to cgroup
+	 * to ensure the successful deletion of cgroup.
+	 */
 	sleep(1);
 	cleanup_cgroup_environment();
 }

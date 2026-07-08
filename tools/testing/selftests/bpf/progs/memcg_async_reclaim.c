@@ -61,8 +61,7 @@ static int get_cgroup_event(u64 cgroup_id, u64 *val)
 
 	if (get_cgroup_memcg_from_id(cgroup_id, &cm))
 		return -1;
-	bpf_mem_cgroup_flush_stats(cm.memcg);
-	*val = bpf_mem_cgroup_page_state(cm.memcg, PGSTEAL_DIRECT);
+	*val = bpf_mem_cgroup_memory_events(cm.memcg, MEMCG_MAX);
 	put_cgroup_memcg(&cm);
 
 	return 0;
@@ -90,8 +89,6 @@ static int reclaim_cgroup(u64 cgroup_id)
 	if (get_cgroup_memcg_from_id(cgroup_id, &cm))
 		return 0;
 
-	bpf_mem_cgroup_flush_stats(cm.memcg);
-
 	for (i = 0; i < RECLAIM_MAX_ITER; i++) {
 		if (!bpf_try_to_free_mem_cgroup_pages(cm.memcg, RECLAIM_PAGES,
 						      GFP_KERNEL, 0, -1))
@@ -110,6 +107,7 @@ struct wq_elem {
 	u64 prev_event;
 	u64 event_delta_threshold;
 	u64 check_ns;
+	bool run_reclaim;
 };
 
 struct {
@@ -125,8 +123,7 @@ static int async_free(void *map, int *key, void *value)
 {
 	struct wq_elem *elem = value;
 
-	if (should_reclaim_cgroup(wq_cgroup_id, &elem->prev_event,
-				  elem->event_delta_threshold)) {
+	if (elem->run_reclaim) {
 		reclaim_cgroup(wq_cgroup_id);
 		bpf_wq_start(&elem->work, 0);
 	}
@@ -136,7 +133,13 @@ static int async_free(void *map, int *key, void *value)
 
 static int wq_timer_cb(void *map, int *key, struct wq_elem *elem)
 {
-	bpf_wq_start(&elem->work, 0);
+	if (should_reclaim_cgroup(wq_cgroup_id, &elem->prev_event,
+				  elem->event_delta_threshold)) {
+		elem->run_reclaim = true;
+		bpf_wq_start(&elem->work, 0);
+	} else
+		elem->run_reclaim = false;
+
 	bpf_timer_start(&elem->timer, elem->check_ns, 0);
 
 	return 0;
@@ -175,6 +178,7 @@ int wq_prog_init(struct bpf_args_s *ctx)
 	elem->prev_event = 0;
 	elem->event_delta_threshold = ctx->event_delta_threshold;
 	elem->check_ns = ctx->check_ns;
+	elem->run_reclaim = false;
 
 	wq_cgroup_id = ctx->cgroup_id;
 
@@ -188,6 +192,7 @@ struct thread_wq_elem {
 	u64 prev_event;
 	u64 event_delta_threshold;
 	u64 check_ns;
+	bool run_reclaim;
 };
 
 struct {
@@ -203,8 +208,7 @@ static int thread_async_free(void *map, int *key, void *value)
 {
 	struct thread_wq_elem *elem = value;
 
-	if (should_reclaim_cgroup(thread_wq_cgroup_id, &elem->prev_event,
-				  elem->event_delta_threshold)) {
+	if (elem->run_reclaim) {
 		reclaim_cgroup(thread_wq_cgroup_id);
 		bpf_thread_wq_start(&elem->work, 0);
 	}
@@ -215,7 +219,13 @@ static int thread_async_free(void *map, int *key, void *value)
 static int
 thread_wq_timer_cb(void *map, int *key, struct thread_wq_elem *elem)
 {
-	bpf_thread_wq_start(&elem->work, 0);
+	if (should_reclaim_cgroup(thread_wq_cgroup_id, &elem->prev_event,
+				  elem->event_delta_threshold)) {
+		elem->run_reclaim = true;
+		bpf_thread_wq_start(&elem->work, 0);
+	} else
+		elem->run_reclaim = false;
+
 	bpf_timer_start(&elem->timer, elem->check_ns, 0);
 
 	return 0;
@@ -255,6 +265,7 @@ int thread_wq_prog_init(struct bpf_args_s *ctx)
 	elem->prev_event = 0;
 	elem->event_delta_threshold = ctx->event_delta_threshold;
 	elem->check_ns = ctx->check_ns;
+	elem->run_reclaim = false;
 
 	thread_wq_cgroup_id = ctx->cgroup_id;
 
