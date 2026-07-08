@@ -323,5 +323,6 @@ cleanup_skel:
 	if (skel)
 		memcg_async_reclaim__destroy(skel);
 cleanup_cgroup:
-	//cleanup_cgroup_environment();
+	sleep(1);
+	cleanup_cgroup_environment();
 }
