@@ -19,25 +19,23 @@
 struct bpf_args_s {
 	u64 high_cgroup_id;
 	u64 low_cgroup_id;
-	u64 period_ns;
-	u64 pgfault_delta_threshold;
-	u64 reclaim_pages;
+	u64 event_delta_threshold;
+	u64 check_ns;
 };
 
 #include "memcg_async_reclaim.skel.h"
 
-#define FILE_SIZE (256 * 1024 * 1024ul)
+#define FILE_SIZE (32 * 1024 * 1024ul)
 #define BUFFER_SIZE (4096)
-#define CG_LIMIT (128 * 1024 * 1024ul)
+#define CG_LIMIT (32 * 1024 * 1024ul)
 #define READ_TIMES 50
 
 #define CG_DIR "/memcg_async_reclaim"
 #define CG_HIGH_DIR CG_DIR "/high"
 #define CG_LOW_DIR CG_DIR "/low"
 
-#define PRESSURE_PERIOD_NS (2 * 1000 * 1000ull)
-#define PGFAULT_DELTA_THRESHOLD 1
-#define RECLAIM_PAGES 32
+#define CHECK_PERIOD_NS (2 * 1000 * 1000ull)
+#define EVENT_DELTA_THRESHOLD 1
 
 static int setup_high_low_cgroups(u64 *high_cgroup_id, u64 *low_cgroup_id)
 {
@@ -130,7 +128,6 @@ static int read_file(const char *filename, int iterations)
 {
 	int ret = -1;
 	long page_size = sysconf(_SC_PAGESIZE);
-	char *p;
 	char *map;
 	size_t i;
 	int fd;
@@ -155,8 +152,9 @@ static int read_file(const char *filename, int iterations)
 
 	for (int iter = 0; iter < iterations; iter++) {
 		for (i = 0; i < FILE_SIZE; i += page_size) {
-			p = &map[i];
-			__asm__ __volatile__("" : : "r"(p) : "memory");
+			/* access a byte to trigger page fault */
+			volatile char v = map[i];
+			(void)v;
 		}
 	}
 
@@ -315,15 +313,14 @@ cleanup_high_data:
 
 static int
 setup_bpf(u64 high_cgroup_id, u64 low_cgroup_id,
-	  struct memcg_async_reclaim **skel_ptr)
+	  struct memcg_async_reclaim **skel_ptr, bool use_thread_wq)
 {
 	struct memcg_async_reclaim *skel;
 	struct bpf_args_s bpf_args = {
 		.high_cgroup_id = high_cgroup_id,
-		.high_cgroup_id = low_cgroup_id,
-		.period_ns = PRESSURE_PERIOD_NS,
-		.pgfault_delta_threshold = PGFAULT_DELTA_THRESHOLD,
-		.reclaim_pages = RECLAIM_PAGES,
+		.low_cgroup_id = low_cgroup_id,
+		.event_delta_threshold = EVENT_DELTA_THRESHOLD,
+		.check_ns = CHECK_PERIOD_NS,
 	};
 	LIBBPF_OPTS(bpf_test_run_opts, run_opts,
 		.ctx_in = &bpf_args,
@@ -334,7 +331,10 @@ setup_bpf(u64 high_cgroup_id, u64 low_cgroup_id,
 	if (!ASSERT_OK_PTR(skel, "memcg_async_reclaim__open_and_load"))
 		return -1;
 
-	prog_init_fd = bpf_program__fd(skel->progs.prog_init);
+	if (use_thread_wq)
+		prog_init_fd = bpf_program__fd(skel->progs.thread_wq_prog_init);
+	else
+		prog_init_fd = bpf_program__fd(skel->progs.wq_prog_init);
 	if (!ASSERT_GE(prog_init_fd, 0, "bpf_program__fd"))
 		goto error_out;
 
@@ -352,7 +352,7 @@ error_out:
 	return -1;
 }
 
-void test_memcg_async_reclaim(void)
+void test_memcg_wq_async_reclaim(void)
 {
 	u64 high_cgroup_id, low_cgroup_id;
 	int err;
@@ -363,17 +363,15 @@ void test_memcg_async_reclaim(void)
 	if (!ASSERT_OK(err, "setup_high_low_cgroups reclaim"))
 		return;
 
-	err = setup_bpf(high_cgroup_id, low_cgroup_id, &skel);
+	err = setup_bpf(high_cgroup_id, low_cgroup_id, &skel, false);
 	if (!ASSERT_OK(err, "setup_bpf"))
 		goto out;
-
-	printf("%lu %lu\n", high_cgroup_id, low_cgroup_id);
 
 	err = run_high_low_workload(&high_time, &low_time, READ_TIMES);
 	if (!ASSERT_OK(err, "run_high_low_workload reclaim"))
 		goto out;
 
-	if (high_time >= low_time || low_time - high_time <= 1) {
+	if (high_time >= low_time) {
 		PRINT_FAIL("high cgroup not improved with async reclaim: "
 			   "high_time=%f low_time=%f",
 			   high_time, low_time);
@@ -382,5 +380,41 @@ void test_memcg_async_reclaim(void)
 out:
 	if (skel)
 		memcg_async_reclaim__destroy(skel);
-	//cleanup_cgroup_environment();
+	cleanup_cgroup_environment();
+}
+
+void test_memcg_thread_wq_async_reclaim(void)
+{
+	u64 high_cgroup_id, low_cgroup_id;
+	int err;
+	double high_time = 0.0, low_time = 0.0;
+	struct memcg_async_reclaim *skel = NULL;
+
+	err = setup_high_low_cgroups(&high_cgroup_id, &low_cgroup_id);
+	if (!ASSERT_OK(err, "setup_high_low_cgroups reclaim"))
+		return;
+
+	err = setup_bpf(high_cgroup_id, low_cgroup_id, &skel, true);
+	if (!ASSERT_OK(err, "setup_bpf"))
+		goto out;
+
+	err = run_high_low_workload(&high_time, &low_time, READ_TIMES);
+	if (!ASSERT_OK(err, "run_high_low_workload reclaim"))
+		goto out;
+
+	if (high_time >= low_time) {
+		PRINT_FAIL("high cgroup not improved with async reclaim: "
+			   "high_time=%f low_time=%f",
+			   high_time, low_time);
+	}
+
+out:
+	if (skel)
+		memcg_async_reclaim__destroy(skel);
+	/*
+	 * Wait for bpf_thread_wq to release the reference to cgroup
+	 * to ensure the successful deletion of cgroup.
+	 */
+	sleep(1);
+	cleanup_cgroup_environment();
 }

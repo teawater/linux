@@ -12,41 +12,31 @@
 #define ___GFP_DIRECT_RECLAIM	BIT(___GFP_DIRECT_RECLAIM_BIT)
 #define ___GFP_KSWAPD_RECLAIM	BIT(___GFP_KSWAPD_RECLAIM_BIT)
 
-#define __GFP_IO	((gfp_t)___GFP_IO)
-#define __GFP_FS	((gfp_t)___GFP_FS)
+#define __GFP_IO		((gfp_t)___GFP_IO)
+#define __GFP_FS		((gfp_t)___GFP_FS)
 #define __GFP_DIRECT_RECLAIM	((gfp_t)___GFP_DIRECT_RECLAIM)
 #define __GFP_KSWAPD_RECLAIM	((gfp_t)___GFP_KSWAPD_RECLAIM)
 #define __GFP_RECLAIM	((gfp_t)(___GFP_DIRECT_RECLAIM | ___GFP_KSWAPD_RECLAIM))
 
 #define GFP_KERNEL	(__GFP_RECLAIM | __GFP_IO | __GFP_FS)
-#define CLOCK_MONOTONIC_ID 1
+#define CLOCK_MONOTONIC_ID	1
+#define RECLAIM_PAGES		32
+#define RECLAIM_MAX_ITER	32
 
 struct bpf_args_s {
 	u64 high_cgroup_id;
 	u64 low_cgroup_id;
-	u64 period_ns;
-	u64 pgfault_delta_threshold;
-	u64 reclaim_pages;
-} bpf_args;
-
-struct reclaim_ctrl {
-	struct bpf_timer timer;
-	struct bpf_wq work;
-	u64 prev_pgfault;
-	u64 reclaim_enabled;
+	u64 event_delta_threshold;
+	u64 check_ns;
 };
-
-struct {
-	__uint(type, BPF_MAP_TYPE_ARRAY);
-	__uint(max_entries, 1);
-	__type(key, __u32);
-	__type(value, struct reclaim_ctrl);
-} reclaim_ctrl_map SEC(".maps");
 
 struct cgroup_memcg {
 	struct cgroup *cgrp;
 	struct mem_cgroup *memcg;
 };
+
+static u64 wq_high_cgroup_id;
+static u64 wq_low_cgroup_id;
 
 static int get_cgroup_memcg_from_id(u64 cgroup_id, struct cgroup_memcg *cm)
 {
@@ -69,119 +59,197 @@ static void put_cgroup_memcg(struct cgroup_memcg *cm)
 	bpf_cgroup_release(cm->cgrp);
 }
 
-#if 0
-static int get_high_cgroup_pgfault(u64 *pgfault)
+static int get_cgroup_event(u64 cgroup_id, u64 *val)
 {
 	struct cgroup_memcg cm;
 
-	if (get_cgroup_memcg_from_id(bpf_args.high_cgroup_id, &cm))
+	if (get_cgroup_memcg_from_id(cgroup_id, &cm))
 		return -1;
-
-	*pgfault = bpf_mem_cgroup_page_state(cm.memcg, PGSTEAL_DIRECT);
+	bpf_mem_cgroup_flush_stats(cm.memcg);
+	*val = bpf_mem_cgroup_page_state(cm.memcg, WORKINGSET_REFAULT_FILE);
 	put_cgroup_memcg(&cm);
 
 	return 0;
 }
-#endif
 
-static int reclaim_work_cb(void *map, int *key, void *value)
+static bool
+should_reclaim_cgroup(u64 cgroup_id, u64 *prev_event, u64 event_delta_threshold)
 {
-	struct reclaim_ctrl *ctrl = value;
+	u64 cur, delta;
+
+	if (get_cgroup_event(cgroup_id, &cur))
+		return false;
+
+	delta = cur - *prev_event;
+	*prev_event = cur;
+
+	return delta >= event_delta_threshold;
+}
+
+static int reclaim_cgroup(u64 cgroup_id)
+{
 	struct cgroup_memcg cm;
 	int i;
 
-	if (get_cgroup_memcg_from_id(bpf_args.low_cgroup_id, &cm))
+	if (get_cgroup_memcg_from_id(cgroup_id, &cm))
 		return 0;
 
-	for (i = 0; i < 16; i++) {
-		if (!ctrl->reclaim_enabled)
-			break;
-		if (!bpf_try_to_free_mem_cgroup_pages(cm.memcg,
-						      bpf_args.reclaim_pages,
+	for (i = 0; i < RECLAIM_MAX_ITER; i++) {
+		if (!bpf_try_to_free_mem_cgroup_pages(cm.memcg, RECLAIM_PAGES,
 						      GFP_KERNEL, 0, -1))
 			break;
-		bpf_printk("r\n");
 	}
-	put_cgroup_memcg(&cm);
 
-	if (ctrl->reclaim_enabled)
-		bpf_wq_start(&ctrl->work, 0);
+	put_cgroup_memcg(&cm);
 
 	return 0;
 }
 
-static int pressure_timer_cb(void *map, int *key, struct reclaim_ctrl *ctrl)
+struct wq_elem {
+	struct bpf_timer timer;
+	struct bpf_wq work;
+	u64 prev_event;
+	u64 event_delta_threshold;
+	u64 check_ns;
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, __u32);
+	__type(value, struct wq_elem);
+} wq_map SEC(".maps");
+
+static int async_free(void *map, int *key, void *value)
 {
-	//u64 pgfault = 0, delta = 0;
+	struct wq_elem *elem = value;
 
-	bpf_printk("t\n");
-	ctrl->reclaim_enabled = 1;
-	bpf_wq_start(&ctrl->work, 0);
-
-#if 0
-	if (!get_high_cgroup_pgfault(&pgfault)) {
-		bpf_printk("%lu %lu\n", ctrl->prev_pgfault, delta);
-		delta = pgfault - ctrl->prev_pgfault;
-		ctrl->prev_pgfault = pgfault;
-
-		//bpf_printk("t%u\n", delta);
-		if (delta >= bpf_args.pgfault_delta_threshold) {
-			ctrl->reclaim_enabled = 1;
-			bpf_wq_start(&ctrl->work, 0);
-			//bpf_printk("t 1\n");
-			bpf_printk("t%u\n", delta);
-		} else {
-			ctrl->reclaim_enabled = 0;
-			//bpf_printk("t 2\n");
-		}
+	if (should_reclaim_cgroup(wq_high_cgroup_id, &elem->prev_event,
+		elem->event_delta_threshold)) {
+		reclaim_cgroup(wq_low_cgroup_id);
+		bpf_wq_start(&elem->work, 0);
 	}
-#endif
 
-	bpf_timer_start(&ctrl->timer, bpf_args.period_ns, 0);
+	return 0;
+}
+
+static int wq_timer_cb(void *map, int *key, struct wq_elem *elem)
+{
+	bpf_wq_start(&elem->work, 0);
+	bpf_timer_start(&elem->timer, elem->check_ns, 0);
+
 	return 0;
 }
 
 SEC("syscall")
-int prog_init(struct bpf_args_s *ctx)
+int wq_prog_init(struct bpf_args_s *ctx)
 {
-	struct reclaim_ctrl *ctrl;
+	struct wq_elem *elem;
 	__u32 key = 0;
 	int ret;
 
-	if (!ctx->high_cgroup_id || !ctx->period_ns || !ctx->reclaim_pages)
+	elem = bpf_map_lookup_elem(&wq_map, &key);
+	if (!elem)
 		return -1;
 
-	ctrl = bpf_map_lookup_elem(&reclaim_ctrl_map, &key);
-	if (!ctrl)
+	ret = bpf_wq_init(&elem->work, &wq_map, 0);
+	if (ret)
+		return ret;
+
+	ret = bpf_wq_set_callback(&elem->work, async_free, 0);
+	if (ret)
+		return ret;
+
+	ret = bpf_timer_init(&elem->timer, &wq_map, CLOCK_MONOTONIC_ID);
+	if (ret)
+		return ret;
+
+	ret = bpf_timer_set_callback(&elem->timer, wq_timer_cb);
+	if (ret)
+		return ret;
+
+	elem->prev_event = 0;
+	elem->event_delta_threshold = ctx->event_delta_threshold;
+	elem->check_ns = ctx->check_ns;
+
+	wq_high_cgroup_id = ctx->high_cgroup_id;
+	wq_low_cgroup_id = ctx->low_cgroup_id;
+
+	return bpf_timer_start(&elem->timer, elem->check_ns, 0);
+}
+
+struct thread_wq_elem {
+	struct bpf_timer timer;
+	struct bpf_thread_wq work;
+	u64 prev_event;
+	u64 event_delta_threshold;
+	u64 check_ns;
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, __u32);
+	__type(value, struct thread_wq_elem);
+} thread_wq_map SEC(".maps");
+
+static int thread_async_free(void *map, int *key, void *value)
+{
+	struct thread_wq_elem *elem = value;
+
+	if (should_reclaim_cgroup(wq_high_cgroup_id, &elem->prev_event,
+		elem->event_delta_threshold)) {
+		reclaim_cgroup(wq_low_cgroup_id);
+		bpf_thread_wq_start(&elem->work, 0);
+	}
+
+	return 0;
+}
+
+static int thread_wq_timer_cb(void *map, int *key, struct thread_wq_elem *elem)
+{
+	bpf_thread_wq_start(&elem->work, 0);
+	bpf_timer_start(&elem->timer, elem->check_ns, 0);
+
+	return 0;
+}
+
+SEC("syscall")
+int thread_wq_prog_init(struct bpf_args_s *ctx)
+{
+	struct thread_wq_elem *elem;
+	__u32 key = 0;
+	int ret;
+
+	elem = bpf_map_lookup_elem(&thread_wq_map, &key);
+	if (!elem)
 		return -1;
 
-	ret = bpf_wq_init(&ctrl->work, &reclaim_ctrl_map, 0);
+	ret = bpf_thread_wq_init(&elem->work, &thread_wq_map,
+				 ctx->low_cgroup_id, 0);
 	if (ret)
 		return ret;
 
-	ret = bpf_wq_set_callback(&ctrl->work, reclaim_work_cb, 0);
+	ret = bpf_thread_wq_set_callback(&elem->work, thread_async_free, 0);
 	if (ret)
 		return ret;
 
-	ret = bpf_timer_init(&ctrl->timer, &reclaim_ctrl_map,
-			     CLOCK_MONOTONIC_ID);
+	ret = bpf_timer_init(&elem->timer, &thread_wq_map, CLOCK_MONOTONIC_ID);
 	if (ret)
 		return ret;
 
-	ret = bpf_timer_set_callback(&ctrl->timer, pressure_timer_cb);
+	ret = bpf_timer_set_callback(&elem->timer, thread_wq_timer_cb);
 	if (ret)
 		return ret;
 
-	ctrl->prev_pgfault = 0;
-	ctrl->reclaim_enabled = 0;
+	elem->prev_event = 0;
+	elem->event_delta_threshold = ctx->event_delta_threshold;
+	elem->check_ns = ctx->check_ns;
 
-	bpf_args.high_cgroup_id = ctx->high_cgroup_id;
-	bpf_args.low_cgroup_id = ctx->low_cgroup_id;
-	bpf_args.period_ns = ctx->period_ns;
-	bpf_args.pgfault_delta_threshold = ctx->pgfault_delta_threshold;
-	bpf_args.reclaim_pages = ctx->reclaim_pages;
+	wq_high_cgroup_id = ctx->high_cgroup_id;
+	wq_low_cgroup_id = ctx->low_cgroup_id;
 
-	return bpf_timer_start(&ctrl->timer, bpf_args.period_ns, 0);
+	return bpf_timer_start(&elem->timer, elem->check_ns, 0);
 }
 
 char LICENSE[] SEC("license") = "GPL";
