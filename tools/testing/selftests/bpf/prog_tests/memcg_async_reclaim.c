@@ -23,10 +23,10 @@ struct bpf_args_s {
 
 #include "memcg_async_reclaim.skel.h"
 
-#define FILE_SIZE (64 * 1024 * 1024ul)
 #define BUFFER_SIZE (4096)
 #define CG_LIMIT (32 * 1024 * 1024ul)
-#define READ_TIMES 2
+#define FILE_SIZE (40 * 1024 * 1024ul)
+#define READ_TIMES 3
 
 #define CG_DIR1 "/memcg_async_reclaim1"
 #define CG_DIR2 "/memcg_async_reclaim2"
@@ -134,7 +134,6 @@ static int read_file(const char *filename, int iterations)
 {
 	int ret = -1;
 	long page_size = sysconf(_SC_PAGESIZE);
-	char *p;
 	char *map;
 	size_t i;
 	int fd;
@@ -157,11 +156,20 @@ static int read_file(const char *filename, int iterations)
 	if (map == MAP_FAILED)
 		goto cleanup_fd;
 
+	/*
+	 * Disable readahead so each access after eviction is a real
+	 * (potentially major) fault instead of being masked by
+	 * sequential prefetch.
+	 */
+	if (madvise(map, FILE_SIZE, MADV_RANDOM))
+		fprintf(stderr, "madvise(MADV_RANDOM) failed: %s\n",
+			strerror(errno));
+
 	for (int iter = 0; iter < iterations; iter++) {
 		for (i = 0; i < FILE_SIZE; i += page_size) {
 			/* access a byte to trigger page fault */
-			p = &map[i];
-			__asm__ __volatile__("" : : "r"(p) : "memory");
+			volatile char v = map[i];
+			(void)v;
 		}
 	}
 
@@ -266,6 +274,7 @@ static int run_workload(const char *cg_path, u64 *max_delta)
 		goto cleanup;
 
 	*max_delta = new_max - old_max;
+
 	ret = 0;
 
 cleanup:
@@ -317,6 +326,8 @@ void test_memcg_async_reclaim(void)
 	ASSERT_LT(max_change3, max_change1,
 		 "bpf_thread_wq async reclaim did not reduce memcg max events");
 
+	printf("%lu %lu %lu", max_change1, max_change2, max_change3);
+
 cleanup_skel:
 	if (skel)
 		memcg_async_reclaim__destroy(skel);
@@ -325,6 +336,6 @@ cleanup_cgroup:
 	 * Wait for bpf_thread_wq to release the reference to cgroup
 	 * to ensure the successful deletion of cgroup.
 	 */
-	sleep(1);
-	cleanup_cgroup_environment();
+	//sleep(1);
+	//cleanup_cgroup_environment();
 }
