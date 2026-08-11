@@ -4829,6 +4829,10 @@ static int evict_folios(unsigned long nr_to_scan, struct lruvec *lruvec,
 	scanned = isolate_folios(nr_to_scan, lruvec, sc, swappiness,
 				 &list, &isolated, &type, &type_scanned);
 
+	if (isolated)
+		__mod_node_page_state(pgdat, NR_ISOLATED_ANON + type,
+				      isolated);
+
 	/* Scanning may have emptied the oldest gen, flush it */
 	if (scanned)
 		try_to_inc_min_seq(lruvec, swappiness);
@@ -4869,6 +4873,8 @@ retry:
 	}
 
 	move_folios_to_lru(&list);
+
+	mod_node_page_state(pgdat, NR_ISOLATED_ANON + type, -isolated);
 
 	walk = current->reclaim_state->mm_walk;
 	if (walk && walk->batched) {
