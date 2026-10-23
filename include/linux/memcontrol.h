@@ -23,6 +23,7 @@
 #include <linux/writeback.h>
 #include <linux/page-flags.h>
 #include <linux/shrinker.h>
+#include <linux/bpf_memcontrol.h>
 
 struct mem_cgroup;
 struct obj_cgroup;
@@ -621,21 +622,35 @@ static inline bool mem_cgroup_unprotected(struct mem_cgroup *target,
 static inline bool mem_cgroup_below_low(struct mem_cgroup *target,
 					struct mem_cgroup *memcg)
 {
+	unsigned long elow, usage;
+
 	if (mem_cgroup_unprotected(target, memcg))
 		return false;
 
-	return READ_ONCE(memcg->memory.elow) >=
-		page_counter_read(&memcg->memory);
+	elow = READ_ONCE(memcg->memory.elow);
+	usage = page_counter_read(&memcg->memory);
+	if (elow >= usage)
+		return true;
+
+	return bpf_memcg_low_policy(memcg, target, elow, usage) &
+	       BPF_MEMCG_PROT_BELOW;
 }
 
 static inline bool mem_cgroup_below_min(struct mem_cgroup *target,
 					struct mem_cgroup *memcg)
 {
+	unsigned long emin, usage;
+
 	if (mem_cgroup_unprotected(target, memcg))
 		return false;
 
-	return READ_ONCE(memcg->memory.emin) >=
-		page_counter_read(&memcg->memory);
+	emin = READ_ONCE(memcg->memory.emin);
+	usage = page_counter_read(&memcg->memory);
+	if (emin >= usage)
+		return true;
+
+	return bpf_memcg_min_policy(memcg, target, emin, usage) &
+	       BPF_MEMCG_PROT_BELOW;
 }
 
 int __mem_cgroup_charge(struct folio *folio, struct mm_struct *mm, gfp_t gfp);

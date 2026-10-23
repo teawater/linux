@@ -255,8 +255,20 @@ static u32 high_policy_stub(const struct bpf_memcg_ctx *ctx)
 	return BPF_MEMCG_HIGH_NO_OPINION;
 }
 
+static u32 low_policy_stub(const struct bpf_memcg_prot_ctx *ctx)
+{
+	return BPF_MEMCG_PROT_NO_OPINION;
+}
+
+static u32 min_policy_stub(const struct bpf_memcg_prot_ctx *ctx)
+{
+	return BPF_MEMCG_PROT_NO_OPINION;
+}
+
 static struct bpf_memcg_ops __bpf_memcg_ops = {
 	.high_policy = high_policy_stub,
+	.low_policy = low_policy_stub,
+	.min_policy = min_policy_stub,
 };
 
 static const struct bpf_func_proto *
@@ -264,7 +276,7 @@ bpf_memcg_get_func_proto(enum bpf_func_id func_id, const struct bpf_prog *prog)
 {
 	/*
 	 * The base set is all a policy needs today, and none of it sleeps.
-	 * Anything added here must be safe from the charge path.
+	 * Anything added here must be safe from the charge and reclaim paths.
 	 */
 	return bpf_base_func_proto(func_id, prog);
 }
@@ -293,7 +305,7 @@ static int bpf_memcg_check_member(const struct btf_type *t,
 				  const struct btf_member *member,
 				  const struct bpf_prog *prog)
 {
-	/* Members run from the charge path, which cannot sleep. */
+	/* Members run from the charge and reclaim paths, which cannot sleep. */
 	if (prog->sleepable)
 		return -EINVAL;
 
@@ -335,6 +347,62 @@ static struct bpf_struct_ops bpf_memcg_ops_desc = {
 	 */
 };
 
+/*
+ * Prepare to run the policies attached to @memcg's cgroup and its ancestors.
+ *
+ * On success returns the cgroup with its bpf reference held, inside the RCU
+ * section the effective array walk needs; the caller finishes with
+ * bpf_memcg_walk_end().  NULL means no policy can run and the caller keeps
+ * the request it started with: nothing is attached anywhere, the cgroup is
+ * on a v1 hierarchy, this task is already inside a policy, or the cgroup is
+ * going.
+ */
+static inline struct cgroup *bpf_memcg_walk_begin(struct mem_cgroup *memcg)
+{
+	struct cgroup *cgrp = memcg->css.cgroup;
+
+	if (!cgroup_bpf_enabled(CGROUP_MEMCG_OPS))
+		return NULL;
+
+	/*
+	 * Only the default hierarchy has a cgroup_bpf, and the static key is
+	 * global, so one policy anywhere turns this on for v1 memcgs too.  A
+	 * v1 cgroup has no effective array and an uninitialised
+	 * cgrp->bpf.refcnt.
+	 */
+	if (!cgroup_on_dfl(cgrp))
+		return NULL;
+
+	/*
+	 * A program can allocate and re-enter the charge path, and reclaim
+	 * with it.  Skip the nested call.  This guards the callbacks only.
+	 */
+	if (current->in_bpf_memcg)
+		return NULL;
+	current->in_bpf_memcg = 1;
+
+	rcu_read_lock_dont_migrate();
+
+	/*
+	 * A memcg outlives its cgroup while it has charges, and
+	 * cgroup_bpf_release() frees the arrays when the cgroup goes.
+	 */
+	if (!cgroup_bpf_tryget_live(cgrp)) {
+		rcu_read_unlock_migrate();
+		current->in_bpf_memcg = 0;
+		return NULL;
+	}
+
+	return cgrp;
+}
+
+static inline void bpf_memcg_walk_end(struct cgroup *cgrp)
+{
+	cgroup_bpf_put(cgrp);
+	rcu_read_unlock_migrate();
+	current->in_bpf_memcg = 0;
+}
+
 static void bpf_memcg_ctx_init(struct bpf_memcg_ctx *ctx,
 			       struct mem_cgroup *memcg,
 			       struct mem_cgroup *over_limit, gfp_t gfp_mask)
@@ -358,36 +426,9 @@ u32 bpf_memcg_high_policy(struct mem_cgroup *memcg,
 	u32 acc = BPF_MEMCG_HIGH_NO_OPINION;
 	struct cgroup *cgrp;
 
-	if (!cgroup_bpf_enabled(CGROUP_MEMCG_OPS))
+	cgrp = bpf_memcg_walk_begin(memcg);
+	if (!cgrp)
 		return acc;
-
-	/*
-	 * Only the default hierarchy has a cgroup_bpf, and the static key is
-	 * global, so one policy anywhere turns this on for v1 memcgs too.  A
-	 * v1 memcg still cannot get here, because memory.high and swap.high
-	 * are both v2-only and so it never builds the debt that leads to this
-	 * call.  A hook on a path v1 can reach needs its own cgroup_on_dfl()
-	 * test: a v1 cgroup has no effective array and an uninitialised
-	 * cgrp->bpf.refcnt.
-	 */
-	cgrp = memcg->css.cgroup;
-
-	/*
-	 * A program can allocate and re-enter the charge path.  Skip the
-	 * nested call.  This guards the callbacks only.
-	 */
-	if (current->in_bpf_memcg)
-		return acc;
-	current->in_bpf_memcg = 1;
-
-	rcu_read_lock_dont_migrate();
-
-	/*
-	 * A memcg outlives its cgroup while it has charges, and
-	 * cgroup_bpf_release() frees the arrays when the cgroup goes.
-	 */
-	if (!cgroup_bpf_tryget_live(cgrp))
-		goto out;
 
 	bpf_memcg_ctx_init(&ctx, memcg, over_limit, gfp_mask);
 
@@ -397,13 +438,64 @@ u32 bpf_memcg_high_policy(struct mem_cgroup *memcg,
 			       BPF_MEMCG_HIGH_VALID_MASK;
 	}
 
-	cgroup_bpf_put(cgrp);
-out:
-	rcu_read_unlock_migrate();
-
-	current->in_bpf_memcg = 0;
+	bpf_memcg_walk_end(cgrp);
 
 	return acc;
+}
+
+/*
+ * Run every low_policy (@is_min false) or min_policy (@is_min true) on
+ * @memcg's cgroup and its ancestors, and return the combined request.
+ */
+static u32 bpf_memcg_prot_policy(struct mem_cgroup *memcg,
+				 struct mem_cgroup *target,
+				 unsigned long threshold, unsigned long usage,
+				 bool is_min)
+{
+	const struct bpf_prog_array_item *item;
+	const struct bpf_memcg_ops *ops;
+	struct bpf_memcg_prot_ctx ctx;
+	u32 acc = BPF_MEMCG_PROT_NO_OPINION;
+	struct cgroup *cgrp;
+
+	cgrp = bpf_memcg_walk_begin(memcg);
+	if (!cgrp)
+		return acc;
+
+	ctx = (struct bpf_memcg_prot_ctx) {
+		.memcg			= memcg,
+		.target			= target,
+		.task			= current,
+		.cgroup_id		= cgroup_id(cgrp),
+		.target_cgroup_id	= target ?
+					cgroup_id(target->css.cgroup) : 0,
+		.threshold		= threshold,
+		.usage			= usage,
+	};
+
+	bpf_cgroup_struct_ops_foreach(ops, item, cgrp, CGROUP_MEMCG_OPS) {
+		u32 (*policy)(const struct bpf_memcg_prot_ctx *ctx);
+
+		policy = is_min ? ops->min_policy : ops->low_policy;
+		if (policy)
+			acc |= policy(&ctx) & BPF_MEMCG_PROT_VALID_MASK;
+	}
+
+	bpf_memcg_walk_end(cgrp);
+
+	return acc;
+}
+
+u32 bpf_memcg_low_policy(struct mem_cgroup *memcg, struct mem_cgroup *target,
+			 unsigned long elow, unsigned long usage)
+{
+	return bpf_memcg_prot_policy(memcg, target, elow, usage, false);
+}
+
+u32 bpf_memcg_min_policy(struct mem_cgroup *memcg, struct mem_cgroup *target,
+			 unsigned long emin, unsigned long usage)
+{
+	return bpf_memcg_prot_policy(memcg, target, emin, usage, true);
 }
 
 static int __init bpf_memcg_ops_register(void)
