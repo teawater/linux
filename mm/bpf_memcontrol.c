@@ -255,8 +255,14 @@ static u32 high_policy_stub(const struct bpf_memcg_ctx *ctx)
 	return BPF_MEMCG_HIGH_NO_OPINION;
 }
 
+static u32 low_request_stub(const struct bpf_memcg_prot_ctx *ctx)
+{
+	return BPF_MEMCG_PROT_NO_REQUEST;
+}
+
 static struct bpf_memcg_ops __bpf_memcg_ops = {
 	.high_policy = high_policy_stub,
+	.low_request = low_request_stub,
 };
 
 static const struct bpf_func_proto *
@@ -264,7 +270,7 @@ bpf_memcg_get_func_proto(enum bpf_func_id func_id, const struct bpf_prog *prog)
 {
 	/*
 	 * The base set is all a policy needs today, and none of it sleeps.
-	 * Anything added here must be safe from the charge path.
+	 * Anything added here must be safe from the charge and reclaim paths.
 	 */
 	return bpf_base_func_proto(func_id, prog);
 }
@@ -293,7 +299,7 @@ static int bpf_memcg_check_member(const struct btf_type *t,
 				  const struct btf_member *member,
 				  const struct bpf_prog *prog)
 {
-	/* Members run from the charge path, which cannot sleep. */
+	/* Members run from the charge and reclaim paths, which cannot sleep. */
 	if (prog->sleepable)
 		return -EINVAL;
 
@@ -335,6 +341,62 @@ static struct bpf_struct_ops bpf_memcg_ops_desc = {
 	 */
 };
 
+/*
+ * Prepare to run the policies attached to @memcg's cgroup and its ancestors.
+ *
+ * On success returns the cgroup with its bpf reference held, inside the RCU
+ * section the effective array walk needs; the caller finishes with
+ * bpf_memcg_walk_end().  NULL means no policy can run - nothing attached, a
+ * v1 hierarchy, re-entry from a policy, or a dying cgroup - and a caller
+ * collecting a request reports none.  Reporting none rather than "unchanged"
+ * is what lets a request expire on the next pass, with no detach hook.
+ */
+static inline struct cgroup *bpf_memcg_walk_begin(const struct mem_cgroup *memcg)
+{
+	struct cgroup *cgrp = memcg->css.cgroup;
+
+	if (!cgroup_bpf_enabled(CGROUP_MEMCG_OPS))
+		return NULL;
+
+	/*
+	 * Only the default hierarchy has a cgroup_bpf, and the static key is
+	 * global, so one policy anywhere turns this on for v1 memcgs too.  A
+	 * v1 cgroup has no effective array and an uninitialised
+	 * cgrp->bpf.refcnt.
+	 */
+	if (!cgroup_on_dfl(cgrp))
+		return NULL;
+
+	/*
+	 * A program can allocate or reclaim and re-enter a hook.  Skip the
+	 * nested call.
+	 */
+	if (current->in_bpf_memcg)
+		return NULL;
+	current->in_bpf_memcg = 1;
+
+	rcu_read_lock_dont_migrate();
+
+	/*
+	 * A memcg outlives its cgroup while it has charges, and
+	 * cgroup_bpf_release() frees the arrays when the cgroup goes.
+	 */
+	if (!cgroup_bpf_tryget_live(cgrp)) {
+		rcu_read_unlock_migrate();
+		current->in_bpf_memcg = 0;
+		return NULL;
+	}
+
+	return cgrp;
+}
+
+static inline void bpf_memcg_walk_end(struct cgroup *cgrp)
+{
+	cgroup_bpf_put(cgrp);
+	rcu_read_unlock_migrate();
+	current->in_bpf_memcg = 0;
+}
+
 static void bpf_memcg_ctx_init(struct bpf_memcg_ctx *ctx,
 			       struct mem_cgroup *memcg,
 			       struct mem_cgroup *over_limit, gfp_t gfp_mask)
@@ -358,36 +420,9 @@ u32 bpf_memcg_high_policy(struct mem_cgroup *memcg,
 	u32 acc = BPF_MEMCG_HIGH_NO_OPINION;
 	struct cgroup *cgrp;
 
-	if (!cgroup_bpf_enabled(CGROUP_MEMCG_OPS))
+	cgrp = bpf_memcg_walk_begin(memcg);
+	if (!cgrp)
 		return acc;
-
-	/*
-	 * Only the default hierarchy has a cgroup_bpf, and the static key is
-	 * global, so one policy anywhere turns this on for v1 memcgs too.  A
-	 * v1 memcg still cannot get here, because memory.high and swap.high
-	 * are both v2-only and so it never builds the debt that leads to this
-	 * call.  A hook on a path v1 can reach needs its own cgroup_on_dfl()
-	 * test: a v1 cgroup has no effective array and an uninitialised
-	 * cgrp->bpf.refcnt.
-	 */
-	cgrp = memcg->css.cgroup;
-
-	/*
-	 * A program can allocate and re-enter the charge path.  Skip the
-	 * nested call.  This guards the callbacks only.
-	 */
-	if (current->in_bpf_memcg)
-		return acc;
-	current->in_bpf_memcg = 1;
-
-	rcu_read_lock_dont_migrate();
-
-	/*
-	 * A memcg outlives its cgroup while it has charges, and
-	 * cgroup_bpf_release() frees the arrays when the cgroup goes.
-	 */
-	if (!cgroup_bpf_tryget_live(cgrp))
-		goto out;
 
 	bpf_memcg_ctx_init(&ctx, memcg, over_limit, gfp_mask);
 
@@ -397,13 +432,61 @@ u32 bpf_memcg_high_policy(struct mem_cgroup *memcg,
 			       BPF_MEMCG_HIGH_VALID_MASK;
 	}
 
-	cgroup_bpf_put(cgrp);
-out:
-	rcu_read_unlock_migrate();
-
-	current->in_bpf_memcg = 0;
+	bpf_memcg_walk_end(cgrp);
 
 	return acc;
+}
+
+/*
+ * Run every low_request on @memcg's cgroup and its ancestors, and return the
+ * protection they ask for, in pages.
+ *
+ * The requests are ORed: the combination is monotone, a policy can raise
+ * what a cgroup claims but never take back what the user declared or
+ * another policy asked for.
+ */
+unsigned long bpf_memcg_low_request(struct mem_cgroup *memcg,
+				    struct mem_cgroup *target,
+				    unsigned long usage)
+{
+	const struct bpf_prog_array_item *item;
+	const struct bpf_memcg_ops *ops;
+	struct bpf_memcg_prot_ctx ctx;
+	u32 acc = BPF_MEMCG_PROT_NO_REQUEST;
+	struct cgroup *cgrp;
+
+	cgrp = bpf_memcg_walk_begin(memcg);
+	if (!cgrp)
+		return 0;
+
+	/*
+	 * @threshold is the elow the last calculation left behind: the
+	 * request has to be known before effective_protection() runs, so
+	 * this pass's value does not exist yet.  The ctx is not const
+	 * because a program may hand ctx->memcg to the memcg kfuncs.
+	 */
+	ctx = (struct bpf_memcg_prot_ctx) {
+		.memcg			= memcg,
+		.target			= target,
+		.task			= current,
+		.cgroup_id		= cgroup_id(cgrp),
+		.target_cgroup_id	= target ?
+					cgroup_id(target->css.cgroup) : 0,
+		.threshold		= READ_ONCE(memcg->memory.elow),
+		.usage			= usage,
+	};
+
+	bpf_cgroup_struct_ops_foreach(ops, item, cgrp, CGROUP_MEMCG_OPS) {
+		u32 (*request)(const struct bpf_memcg_prot_ctx *ctx);
+
+		request = ops->low_request;
+		if (request)
+			acc |= request(&ctx) & BPF_MEMCG_PROT_VALID_MASK;
+	}
+
+	bpf_memcg_walk_end(cgrp);
+
+	return (acc & BPF_MEMCG_PROT_REQUEST_USAGE) ? usage : 0;
 }
 
 static int __init bpf_memcg_ops_register(void)

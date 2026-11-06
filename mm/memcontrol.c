@@ -4490,6 +4490,7 @@ static void mem_cgroup_css_offline(struct cgroup_subsys_state *css)
 
 	page_counter_set_min(&memcg->memory, 0);
 	page_counter_set_low(&memcg->memory, 0);
+	page_counter_set_low_req(&memcg->memory, 0);
 
 	zswap_memcg_offline_cleanup(memcg);
 
@@ -4572,6 +4573,7 @@ static void mem_cgroup_css_reset(struct cgroup_subsys_state *css)
 #endif
 	page_counter_set_min(&memcg->memory, 0);
 	page_counter_set_low(&memcg->memory, 0);
+	page_counter_set_low_req(&memcg->memory, 0);
 	page_counter_set_high(&memcg->memory, PAGE_COUNTER_MAX);
 	page_counter_set_high(&memcg->swap, PAGE_COUNTER_MAX);
 	memcg_wb_domain_size_changed(memcg);
@@ -5333,12 +5335,26 @@ void mem_cgroup_calculate_protection(struct mem_cgroup *root,
 {
 	bool recursive_protection =
 		cgrp_dfl_root.flags & CGRP_ROOT_MEMORY_RECURSIVE_PROT;
+	struct mem_cgroup *target = root;
 
 	if (mem_cgroup_disabled())
 		return;
 
 	if (!root)
 		root = root_mem_cgroup;
+
+	/*
+	 * Collect the request before elow is computed: it is an input to the
+	 * arbitration.  The reclaim root's own protection is ignored, so
+	 * there is nothing to ask for there.  @target keeps the caller's
+	 * NULL, which is how a policy recognises global reclaim.
+	 */
+	if (root != memcg) {
+		unsigned long usage = page_counter_read(&memcg->memory);
+		unsigned long req = bpf_memcg_low_request(memcg, target, usage);
+
+		page_counter_set_low_req(&memcg->memory, req);
+	}
 
 	page_counter_calculate_protection(&root->memory, &memcg->memory, recursive_protection);
 }
@@ -5358,6 +5374,8 @@ void mem_cgroup_calculate_protection_path(struct mem_cgroup *root,
 {
 	bool recursive_protection =
 		cgrp_dfl_root.flags & CGRP_ROOT_MEMORY_RECURSIVE_PROT;
+	struct mem_cgroup *target = root;
+	unsigned long usage, req;
 	struct cgroup *cg;
 	int root_level, i;
 
@@ -5369,6 +5387,18 @@ void mem_cgroup_calculate_protection_path(struct mem_cgroup *root,
 
 	if (memcg == root)
 		return;
+
+	/*
+	 * Ask for @memcg only: shrink_one() calls this per memcg, so asking
+	 * per level would multiply the cost by the depth of the tree.  The
+	 * ancestors keep the request the last top-down traversal left them
+	 * with; their elow - the cap @memcg is arbitrated against - is no
+	 * more stale than it already is for a value computed outside the
+	 * reclaim iteration.
+	 */
+	usage = page_counter_read(&memcg->memory);
+	req = bpf_memcg_low_request(memcg, target, usage);
+	page_counter_set_low_req(&memcg->memory, req);
 
 	root_level = root->css.cgroup->level;
 	cg = memcg->css.cgroup;

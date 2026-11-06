@@ -19,6 +19,16 @@ static bool track_protection(struct page_counter *c)
 	return c->protection_support;
 }
 
+/*
+ * What a counter claims as low protection: what the user declared, or what a
+ * policy requested for this pass, whichever is larger.  A request can only
+ * raise the claim, never take back what memory.low already grants.
+ */
+static unsigned long low_setting(const struct page_counter *c)
+{
+	return max(READ_ONCE(c->low), READ_ONCE(c->low_req));
+}
+
 static void propagate_protected_usage(struct page_counter *c,
 				      unsigned long usage)
 {
@@ -37,7 +47,7 @@ static void propagate_protected_usage(struct page_counter *c,
 			atomic_long_add(delta, &c->parent->children_min_usage);
 	}
 
-	protected = min(usage, READ_ONCE(c->low));
+	protected = min(usage, low_setting(c));
 	old_protected = atomic_long_read(&c->low_usage);
 	if (protected != old_protected) {
 		old_protected = atomic_long_xchg(&c->low_usage, protected);
@@ -282,6 +292,36 @@ void page_counter_set_low(struct page_counter *counter, unsigned long nr_pages)
 }
 
 /**
+ * page_counter_set_low_req - set the low protection a policy requested
+ * @counter: counter
+ * @nr_pages: value to set, in pages
+ *
+ * Unlike page_counter_set_low(), this runs from reclaim and may be called
+ * for the same counter concurrently: the request is last-writer-wins, and
+ * propagate_protected_usage() keeps the parent's aggregate with an
+ * xchg-and-delta, so racing callers converge rather than leak.  A stale
+ * aggregate can skew how the siblings share the budget for one pass, but
+ * each cgroup's cap still comes from parent->elow, so no cgroup is ever
+ * protected beyond what the parent affords.
+ *
+ * Returns early when unchanged: reclaim asks on every pass for every
+ * cgroup, and re-walking to the root each time is not free.
+ */
+void page_counter_set_low_req(struct page_counter *counter,
+			      unsigned long nr_pages)
+{
+	struct page_counter *c;
+
+	if (READ_ONCE(counter->low_req) == nr_pages)
+		return;
+
+	WRITE_ONCE(counter->low_req, nr_pages);
+
+	for (c = counter; c; c = c->parent)
+		propagate_protected_usage(c, atomic_long_read(&c->usage));
+}
+
+/**
  * page_counter_memparse - memparse() for page counter limits
  * @buf: string to parse
  * @max: string meaning maximum possible value
@@ -354,6 +394,11 @@ int page_counter_memparse(const char *buf, const char *max,
  * Note that 4. and 5. are not in conflict: 4. is about protecting
  * against immediate siblings whereas 5. is about protecting against
  * neighboring subtrees.
+ *
+ * For memory.low, @setting is the larger of what the user declared and what
+ * an attached policy requested for this pass; see low_setting().  A request
+ * goes through every rule above, so it can redistribute the parent's budget
+ * among siblings but cannot lift the cap rule 2 puts on the subtree.
  */
 static unsigned long effective_protection(unsigned long usage,
 					  unsigned long parent_usage,
@@ -473,7 +518,7 @@ void page_counter_calculate_protection(struct page_counter *root,
 
 	if (parent == root) {
 		WRITE_ONCE(counter->emin, READ_ONCE(counter->min));
-		WRITE_ONCE(counter->elow, READ_ONCE(counter->low));
+		WRITE_ONCE(counter->elow, low_setting(counter));
 		return;
 	}
 
@@ -486,7 +531,7 @@ void page_counter_calculate_protection(struct page_counter *root,
 			recursive_protection));
 
 	WRITE_ONCE(counter->elow, effective_protection(usage, parent_usage,
-			READ_ONCE(counter->low),
+			low_setting(counter),
 			READ_ONCE(parent->elow),
 			atomic_long_read(&parent->children_low_usage),
 			recursive_protection));

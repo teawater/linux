@@ -38,6 +38,12 @@ struct page_counter {
 	bool track_failcnt;
 	unsigned long min;
 	unsigned long low;
+	/*
+	 * Protection requested for this pass by an attached policy, in pages.
+	 * Arbitrated exactly like @low - see effective_protection() - so a
+	 * request can redistribute the parent's budget but never exceed it.
+	 */
+	unsigned long low_req;
 	unsigned long high;
 	unsigned long max;
 	struct page_counter *parent;
@@ -77,6 +83,8 @@ bool page_counter_try_charge(struct page_counter *counter,
 void page_counter_uncharge(struct page_counter *counter, unsigned long nr_pages);
 void page_counter_set_min(struct page_counter *counter, unsigned long nr_pages);
 void page_counter_set_low(struct page_counter *counter, unsigned long nr_pages);
+void page_counter_set_low_req(struct page_counter *counter,
+			      unsigned long nr_pages);
 
 static inline void page_counter_set_high(struct page_counter *counter,
 					 unsigned long nr_pages)
